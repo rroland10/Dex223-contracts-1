@@ -2087,6 +2087,23 @@ contract MarginModule is Multicall, IOrderParams
     uint256 public orderIndex;
     uint256 public positionIndex;
 
+    // Reentrancy guard. Every fund-moving entry point below hands control to untrusted code at some
+    // point - `_receiveAsset` pulls a caller-chosen token, `_sendAsset` on an ERC-223 asset invokes the
+    // recipient's `tokenReceived`, and `_sendEth` uses call{value:} with all gas.
+    //
+    // NOTE: `marginSwap` / `marginSwap223` are deliberately NOT guarded: `_liquidate` reaches them via
+    // `_swapToBaseAsset`, so guarding them would deadlock liquidation. That path is already covered
+    // because `liquidate()` itself holds the guard. A top-level `marginSwap` is restricted to the
+    // position owner or its liquidator.
+    bool private _entered;
+
+    modifier nonReentrant() {
+        require(!_entered, "REENTRANCY");
+        _entered = true;
+        _;
+        _entered = false;
+    }
+
     event OrderCreated(
         uint256 indexed orderId,
         address indexed owner,
@@ -2450,7 +2467,7 @@ contract MarginModule is Multicall, IOrderParams
         emit OrderModified(_orderId, msg.sender, order.baseAsset, _whitelist, _interestRate, _duration, _minLoan, _leverage, _oracle);
     }
 
-    function orderDepositEth(uint256 _orderId) public payable onlyOrderOwner(_orderId) {
+    function orderDepositEth(uint256 _orderId) public payable nonReentrant onlyOrderOwner(_orderId) {
         require(isOrderOpen(_orderId), "Order is expired");
         require(orders[_orderId].baseAsset == address(0));
 
@@ -2473,7 +2490,7 @@ contract MarginModule is Multicall, IOrderParams
         emit OrderDeposit(_orderId, address(0), _balanceDelta);
     }
 
-    function orderDepositToken(uint256 _orderId, uint256 amount) public onlyOrderOwner(_orderId) {
+    function orderDepositToken(uint256 _orderId, uint256 amount) public nonReentrant onlyOrderOwner(_orderId) {
         require(isOrderOpen(_orderId), "Order is expired");
         require(orders[_orderId].baseAsset != address(0));
 
@@ -2491,7 +2508,7 @@ contract MarginModule is Multicall, IOrderParams
         return isActivated && isNotExpired && order_status[id].alive;
     }
 
-    function orderWithdraw(uint256 _orderId, uint256 amount) public onlyOrderOwner(_orderId) {
+    function orderWithdraw(uint256 _orderId, uint256 amount) public nonReentrant onlyOrderOwner(_orderId) {
         require(orders[_orderId].owner == msg.sender);
         // withdrawal is possible only when the order is closed
         //require(!isOrderOpen(_orderId), "Order is still active");
@@ -2508,7 +2525,7 @@ contract MarginModule is Multicall, IOrderParams
     }
 
     // TODO: Anyone can deposit funds to a position, not only the owner of the position.
-    function positionDeposit(uint256 positionId, address asset, uint256 idInWhitelist,  uint256 amount) public {
+    function positionDeposit(uint256 positionId, address asset, uint256 idInWhitelist,  uint256 amount) public nonReentrant {
         require(positions[positionId].owner == msg.sender, "Only the owner can deposit into this position");
         require(amount > 0, "Deposit must exceed zero");
 
@@ -2585,7 +2602,7 @@ contract MarginModule is Multicall, IOrderParams
         balances.pop();
     }
 
-    function takeLoan(uint256 _orderId, uint256 _amount, uint256 _collateralIdx, uint256 _collateralAmount) public payable
+    function takeLoan(uint256 _orderId, uint256 _amount, uint256 _collateralIdx, uint256 _collateralAmount) public payable nonReentrant
     {
         // Make sure that both collateralToken and LiquidationRewardToken are approved
         // in sufficient quantity.
@@ -2643,55 +2660,67 @@ contract MarginModule is Multicall, IOrderParams
             0,
             address(0));
 
-        positionInitialCollateral[positionIndex] = order.collateralAssets[_collateralIdx];
-        positions[positionIndex] = _newPosition;
+        // SECURITY: claim this position's id and advance the counter BEFORE the _receiveAsset calls
+        // below. Those pull a caller-chosen collateral / reward asset, so a malicious token can hand
+        // control back here (ERC-20 transferFrom, or an ERC-223 tokenReceived hook) and re-enter
+        // takeLoan. `positionIndex` used to be incremented only as the final statement of this
+        // function, so the nested call reused the same id: it overwrote positions[id], appended its
+        // assets onto the same record via addAsset(), and debited order.balance a second time.
+        uint256 _positionId = positionIndex;
+        positionIndex++;
+
+        positionInitialCollateral[_positionId] = order.collateralAssets[_collateralIdx];
+        positions[_positionId] = _newPosition;
 
         order.balance -= _amount;
-        addAsset(positionIndex, order.baseAsset, _amount);
-        addAsset(positionIndex, order.collateralAssets[_collateralIdx], _collateralAmount);
+        addAsset(_positionId, order.baseAsset, _amount);
+        addAsset(_positionId, order.collateralAssets[_collateralIdx], _collateralAmount);
 
-        uint256 receivedEth = msg.value;
+        // Scoped so receivedEth / rewardAmount / rewardAsset are released before the emits below;
+        // without this the extra `_positionId` local pushes the function over the EVM stack limit.
+        {
+            uint256 receivedEth = msg.value;
 
-        // Deposit collateral
-        // In case the collateral asset is Ether
-        if (order.collateralAssets[_collateralIdx] == address(0)) {
-            require(receivedEth >= _collateralAmount, "ETH reception error");
-            receivedEth -= _collateralAmount;
-        // or ERC-20
-        } else {
-            _receiveAsset(order.collateralAssets[_collateralIdx], _collateralAmount);
-        }
+            // Deposit collateral
+            // In case the collateral asset is Ether
+            if (order.collateralAssets[_collateralIdx] == address(0)) {
+                require(receivedEth >= _collateralAmount, "ETH reception error");
+                receivedEth -= _collateralAmount;
+            // or ERC-20
+            } else {
+                _receiveAsset(order.collateralAssets[_collateralIdx], _collateralAmount);
+            }
 
-        // Deposit the liquidation reward
-        // In case the reward asset is Ether
-        (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(_orderId);
-        if (rewardAsset == address(0)) {
-            require(receivedEth >= rewardAmount, "ETH reward reception error");
-            receivedEth -= rewardAmount;
-        // or ERC-20
-        } else {
-            _receiveAsset(rewardAsset, rewardAmount);
+            // Deposit the liquidation reward
+            // In case the reward asset is Ether
+            (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(_orderId);
+            if (rewardAsset == address(0)) {
+                require(receivedEth >= rewardAmount, "ETH reward reception error");
+                receivedEth -= rewardAmount;
+            // or ERC-20
+            } else {
+                _receiveAsset(rewardAsset, rewardAmount);
+            }
         }
 
         // Make sure position is not subject to liquidation right after it was created.
         // Revert otherwise.
         // This automatically checks if all the collateral that was paid satisfies the criteria set by the lender.
 
-        require(!subjectToLiquidation(positionIndex), "Position is immediately exposed to liquidation");
+        require(!subjectToLiquidation(_positionId), "Position is immediately exposed to liquidation");
 
         // Increment the amount of active positions associated with the parent order,
         // we are tracking the active positions to make sure that the Order owner
         // will not modify an Order that has any active positins.
         order_status[_orderId].positions++;
 
-        emit PositionOpened(positionIndex, msg.sender, _amount, order.baseAsset, order.collateralAssets[_collateralIdx], _collateralAmount);
-        emit InitialLeverage(positionIndex, ((collateralEquivalentInBaseAsset + _amount) / collateralEquivalentInBaseAsset));
-        emit NewAsset(positionIndex, order.baseAsset);
+        emit PositionOpened(_positionId, msg.sender, _amount, order.baseAsset, order.collateralAssets[_collateralIdx], _collateralAmount);
+        emit InitialLeverage(_positionId, ((collateralEquivalentInBaseAsset + _amount) / collateralEquivalentInBaseAsset));
+        emit NewAsset(_positionId, order.baseAsset);
         if (order.collateralAssets[_collateralIdx] != order.baseAsset)
         {
-            emit NewAsset(positionIndex, order.collateralAssets[_collateralIdx]);
+            emit NewAsset(_positionId, order.collateralAssets[_collateralIdx]);
         }
-        positionIndex++;
     }
 
     function marginSwap(
@@ -2973,7 +3002,7 @@ contract MarginModule is Multicall, IOrderParams
         return requiredAmount;
     }
 
-    function liquidate(uint256 positionId, address receiver) public {
+    function liquidate(uint256 positionId, address receiver) public nonReentrant {
         Position storage position = positions[positionId];
 
         require(position.open, "Position is closed");
@@ -3004,7 +3033,7 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
-    function positionClose(uint256 positionId, bool autoWithdraw) public {
+    function positionClose(uint256 positionId, bool autoWithdraw) public nonReentrant {
         // TODO: Implement autowithdraw if specified as True
         Position storage position = positions[positionId];
         Order storage order = orders[position.orderId];
@@ -3075,12 +3104,18 @@ contract MarginModule is Multicall, IOrderParams
             
             for (uint256 i = 0; i < position.assets.length; i++)
             {
-                positionWithdraw(positionId, position.assets[i]);
+                _positionWithdraw(positionId, position.assets[i]);
             }
         }
     }
 
-    function positionWithdraw(uint256 positionId, address asset) public {
+    function positionWithdraw(uint256 positionId, address asset) public nonReentrant {
+        _positionWithdraw(positionId, asset);
+    }
+
+    /// @dev Body of positionWithdraw. positionClose() calls this directly because it already holds the
+    /// reentrancy guard; going through the public entry point would deadlock.
+    function _positionWithdraw(uint256 positionId, address asset) internal {
         Position storage position = positions[positionId];
         require(position.owner == msg.sender);
         require(!position.open, "Withdraw only from closed position");
@@ -3114,6 +3149,23 @@ contract MarginModule is Multicall, IOrderParams
         }
         _paybackBaseAsset(position);
 
+        // SECURITY: close the position and update the parent order BEFORE paying the liquidation
+        // reward. The reward goes to a caller-supplied `_receiver` (see liquidate(positionId, receiver)),
+        // and both payout paths hand control to it - `_sendEth` uses call{value:} with all gas, and
+        // `_sendAsset` on an ERC-223 asset invokes the recipient's `tokenReceived`. With the flags set
+        // afterwards, that receiver could re-enter liquidate(): `position.open` was still true and
+        // `subjectToLiquidation` still returned true (the assets have been swapped away and the base
+        // balance zeroed by _paybackBaseAsset, while calculateDebtAmount still reports the full debt
+        // because initialBalance is never reduced), so the reward was paid again on every re-entry, and
+        // `positions--` underflowed - permanently blocking modifyOrder/orderSetCollaterals, which
+        // require positions == 0. positionClose() already uses this ordering.
+        position.open = false;
+
+        // Once the position is liquidated
+        // we can decrease the number of active positions for the parent order.
+        // If the number of active positions is 0 then the order owner can modify the order.
+        order_status[position.orderId].positions--;
+
         // Payment of liquidation reward
         (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(position.orderId);
         if (rewardAsset == address(0)) 
@@ -3124,13 +3176,6 @@ contract MarginModule is Multicall, IOrderParams
         {
             _sendAsset(rewardAsset, rewardAmount, _receiver);
         }
-
-        position.open = false;
-
-        // Once the position is liquidated
-        // we can decrease the number of active positions for the parent order.
-        // If the number of active positions is 0 then the order owner can modify the order.
-        order_status[position.orderId].positions--;
     }
 
     /* Internal functions */
@@ -3223,7 +3268,7 @@ contract MarginModule is Multicall, IOrderParams
         return 0x8943ec02;
     }
 
-    function withdraw223(address asset) public {
+    function withdraw223(address asset) public nonReentrant {
         uint256 amount = erc223deposit[msg.sender][asset]; 
         require(amount > 0);
 
