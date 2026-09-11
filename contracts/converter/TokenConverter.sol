@@ -153,14 +153,6 @@ contract ERC223WrapperToken is IERC223, ERC165, ERC20Rescue
     address public creator = msg.sender;
     address private wrapper_for;
     bool private wrapper_for_set;
-    bool private _reentrancyLock;
-
-    modifier nonReentrant() {
-        require(!_reentrancyLock, "ReentrancyGuard: reentrant call");
-        _reentrancyLock = true;
-        _;
-        _reentrancyLock = false;
-    }
 
     mapping(address account => mapping(address spender => uint256)) private allowances;
 
@@ -204,7 +196,7 @@ contract ERC223WrapperToken is IERC223, ERC165, ERC20Rescue
      * @param _value - the quantity of tokens to transfer.
      * @param _data  - metadata to send alongside the transaction. Can be used to encode subsequent calls in the recipient.
      */
-    function transfer(address _to, uint _value, bytes calldata _data) public payable override nonReentrant returns (bool success)
+    function transfer(address _to, uint _value, bytes calldata _data) public payable override returns (bool success)
     {
         require(_to != address(0), "ERC223: transfer to the zero address");
         balances[msg.sender] = balances[msg.sender] - _value;
@@ -232,7 +224,7 @@ contract ERC223WrapperToken is IERC223, ERC165, ERC20Rescue
      * @param _to    - transfer recipient. Can be contract or EOA.
      * @param _value - the quantity of tokens to transfer.
      */
-    function transfer(address _to, uint _value) public override nonReentrant returns (bool success)
+    function transfer(address _to, uint _value) public override returns (bool success)
     {
         require(_to != address(0), "ERC223: transfer to the zero address");
         bytes memory _empty = hex"00000000";
