@@ -6,6 +6,6 @@ exports[`#fees when price is below the position range gas 1`] = `49616`;
 
 exports[`#fees when price is within the position range gas 1`] = `56014`;
 
-exports[`#principal gas 1`] = `23197`;
+exports[`#principal gas 1`] = `23238`;
 
-exports[`#total gas 1`] = `62929`;
+exports[`#total gas 1`] = `62970`;
