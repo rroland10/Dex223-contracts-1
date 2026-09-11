@@ -4,3 +4,7 @@
 /package-lock.json
 .env
 /node_modules/
+.sepolia-reentrancy-state.json
+
+.playwright-mcp/
+dex223-sepolia-fixed.png

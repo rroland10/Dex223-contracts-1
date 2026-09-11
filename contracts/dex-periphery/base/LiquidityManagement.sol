@@ -97,6 +97,7 @@ abstract contract LiquidityManagement is IUniswapV3MintCallback, PeripheryImmuta
         PoolAddress.PoolKey memory poolKey =
             PoolAddress.PoolKey({token0: params.token0, token1: params.token1, fee: params.fee});
 
+        //pool = IUniswapV3Pool(PoolAddress.computeAddress(factory, poolKey));
         address poolAddr = IDex223Factory(factory).getPool(params.token0, params.token1, params.fee);
         require(poolAddr != address(0), 'LM: pool does not exist');
         pool = IUniswapV3Pool(poolAddr);
