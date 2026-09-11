@@ -27,7 +27,7 @@ contract MockTestDex223Pool is Dex223Pool {
         uint160 sqrtPriceLimitX96,
         bool prefer223,
         bytes memory data
-    ) external override adjustableSender // noDelegateCall will not prevent delegatecalling
+    ) external override lock adjustableSender // noDelegateCall will not prevent delegatecalling
         // this method from the same contract via `tokenReceived` of ERC-223
     returns (int256 amount0, int256 amount1) {
 
