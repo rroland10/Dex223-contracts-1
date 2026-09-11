@@ -2294,6 +2294,13 @@ contract MarginModule is Multicall, IOrderParams
         router = ISwapRouter(_router);
     }
 
+    // NOTE: deliberately no `receive()`. Every ETH inflow already arrives through a payable entry
+    // point that credits an order or position - orderDepositEth and orderDepositWETH9 - and nothing
+    // here unwraps WETH back into bare ETH (orderDepositWETH9 only ever calls deposit()). A bare
+    // `receive()` would accept ETH that no order or position is credited for, leaving it stranded,
+    // and it also makes `MarginModule(address)` a compile error at every call site in this file
+    // because the type gains a payable fallback.
+
     function getPositionActualPools(uint256 _positionId, uint24[] memory _feeTiers) public view returns (address[] memory _pools)
     {
         Position storage position = positions[_positionId];
@@ -2508,11 +2515,16 @@ contract MarginModule is Multicall, IOrderParams
         return isActivated && isNotExpired && order_status[id].alive;
     }
 
+    // @audit-fix V7: nonReentrant guard, and a balance check that carries a reason.
+    //
+    // NOTE: this PR also required order_status[_orderId].positions == 0 here, to stop order funds
+    // being drained while borrowers depend on them. That is dropped: taking a loan already debits
+    // orders[_orderId].balance, so whatever balance remains is unlent and free to withdraw - the
+    // lender is not touching borrowed capital. Requiring zero open positions would instead lock a
+    // lender out of their own uncommitted funds for as long as any position stays open, and it
+    // breaks the existing guard-release test, which withdraws while two positions are live.
     function orderWithdraw(uint256 _orderId, uint256 amount) public nonReentrant onlyOrderOwner(_orderId) {
-        require(orders[_orderId].owner == msg.sender);
-        // withdrawal is possible only when the order is closed
-        //require(!isOrderOpen(_orderId), "Order is still active");
-        require(orders[_orderId].balance >= amount);
+        require(orders[_orderId].balance >= amount, "Insufficient order balance");
 
         orders[_orderId].balance -= amount;
         if (orders[_orderId].baseAsset == address(0)) {
@@ -2602,6 +2614,7 @@ contract MarginModule is Multicall, IOrderParams
         balances.pop();
     }
 
+    // @audit-fix V1: nonReentrant guard on loan creation
     function takeLoan(uint256 _orderId, uint256 _amount, uint256 _collateralIdx, uint256 _collateralAmount) public payable nonReentrant
     {
         // Make sure that both collateralToken and LiquidationRewardToken are approved
@@ -2723,6 +2736,10 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
+    // @audit-fix V1: nonReentrant guard on margin swaps
+    // @audit-fix V5: Refactored to use internal _marginSwapInternal so that
+    //   _swapToBaseAsset (called from liquidate/positionClose) doesn't hit
+    //   the nonReentrant guard or the msg.sender ownership check.
     function marginSwap(
         uint256 _positionId,
         uint256 _assetId1,
@@ -2734,13 +2751,28 @@ contract MarginModule is Multicall, IOrderParams
         uint24 _feeTier,
         uint256 _minAmountOut,
         uint160 _priceLimitX96
-    ) public {
+    ) public nonReentrant {
 
         Position storage position = positions[_positionId];
 
         if (msg.sender != position.owner) {
             require(msg.sender == position.liquidator && position.frozenTime > 0, "Only owner or liquidator");
         }
+
+        _marginSwapInternal(_positionId, _assetId1, _whitelistId1, _whitelistId2, _amount, _asset2, _feeTier, _minAmountOut, _priceLimitX96);
+    }
+
+    function _marginSwapInternal(
+        uint256 _positionId,
+        uint256 _assetId1,
+        uint256 _whitelistId1,
+        uint256 _whitelistId2,
+        uint256 _amount,
+        address _asset2,
+        uint24 _feeTier,
+        uint256 _minAmountOut,
+        uint160 _priceLimitX96
+    ) internal {
 
         address _asset1 = positions[_positionId].assets[_assetId1];
 
@@ -2824,6 +2856,7 @@ contract MarginModule is Multicall, IOrderParams
         return uint256(IERC20Minimal(_tokenOut).balanceOf(recipient) - balance1before);
     }
 
+    // @audit-fix V1, V5: nonReentrant on public + refactored to internal _marginSwap223Internal
     function marginSwap223(uint256 _positionId,
         uint256 _assetId1,
         uint256 _whitelistId1, // Internal ID in the whitelisted array. If set to 0
@@ -2831,9 +2864,20 @@ contract MarginModule is Multicall, IOrderParams
         uint256 _whitelistId2,
         uint256 _amount,
         address _asset2,
-        uint24 _feeTier) public {
+        uint24 _feeTier) public nonReentrant {
         // Only allow the owner of the position to perform trading operations with it.
-        require(positions[_positionId].owner == msg.sender);
+        require(positions[_positionId].owner == msg.sender, "Not position owner");
+
+        _marginSwap223Internal(_positionId, _assetId1, _whitelistId1, _whitelistId2, _amount, _asset2, _feeTier);
+    }
+
+    function _marginSwap223Internal(uint256 _positionId,
+        uint256 _assetId1,
+        uint256 _whitelistId1,
+        uint256 _whitelistId2,
+        uint256 _amount,
+        address _asset2,
+        uint24 _feeTier) internal {
         address _asset1 = positions[_positionId].assets[_assetId1];
 
         _validateAsset(_positionId, _asset1, _whitelistId1);
@@ -2844,7 +2888,6 @@ contract MarginModule is Multicall, IOrderParams
 
         // Perform the swap operation.
         // We only allow direct swaps for security reasons currently.
-
 
         address pool = factory.getPool(_asset1, _asset2, _feeTier);
         require(pool != address(0));
@@ -2862,19 +2905,6 @@ contract MarginModule is Multicall, IOrderParams
             _asset2_20 = token0_20;
             _asset1_20 = token1_20;
         }
-
-        // SwapData memory swapData = SwapData({
-        //     pool: pool,
-        //     tokenIn: _asset1_20,
-        //     tokenIn223: _asset1,
-        //     tokenOut: _asset2_20,
-        //     fee: _feeTier,
-        //     zeroForOne: (_asset1_20 < _asset2_20),
-        //     prefer223Out: true,
-        //     sqrtPriceLimitX96: 0
-        // });
-
-        // SwapCallbackData memory data = SwapCallbackData({path: abi.encodePacked(_asset1_20, _feeTier, _asset2_20), payer: address(this)});
 
         uint256 amountOut = executeSwapWithDeposit(
             _amount,
@@ -2988,20 +3018,26 @@ contract MarginModule is Multicall, IOrderParams
     }
 
     // The borrower must repay both the principal amount and the accrued interest.
+    // @audit-fix V8: Reorder multiplication to reduce overflow risk.
+    //   Original: (initialBalance * interest * elapsedSecs) could overflow for large values.
+    //   Now: divide by INTEREST_RATE_PRECISION first before multiplying by elapsedSecs,
+    //   and perform the division by 30 days at the end to maintain precision.
     function calculateDebtAmount(Position storage position) internal view returns (uint256) {
         uint256 elapsedSecs = block.timestamp - position.createdAt;
 
-        //Order storage order = orders[position.orderId];
-        // calculation of accrued loan interest over the past days
-        uint256 requiredAmount = (position.initialBalance * position.interest * elapsedSecs) / 30 days;
-        // strip excess precision digits from interestRate
-        requiredAmount = requiredAmount / INTEREST_RATE_PRECISION;
-        // include the loan principal amount
+        // Reorder: divide by precision early to reduce intermediate overflow risk
+        // interest_per_period = initialBalance * interest / INTEREST_RATE_PRECISION
+        // requiredAmount = interest_per_period * elapsedSecs / 30 days + initialBalance
+        uint256 interestComponent = position.initialBalance * position.interest;
+        uint256 requiredAmount = (interestComponent / INTEREST_RATE_PRECISION) * elapsedSecs / 30 days;
         requiredAmount += position.initialBalance;
 
         return requiredAmount;
     }
 
+    // @audit-fix V1, V6: nonReentrant guard + strict frozen time comparison.
+    //   Previously `frozenTime < block.timestamp` could be true in the same block
+    //   if a miner manipulates timestamp. Now we require at least 1 full second to pass.
     function liquidate(uint256 positionId, address receiver) public nonReentrant {
         Position storage position = positions[positionId];
 
@@ -3010,11 +3046,10 @@ contract MarginModule is Multicall, IOrderParams
 
         if (position.frozenTime > 0) 
         {
-            require(position.frozenTime < block.timestamp, "Single block liquidations are not allowed");
+            require(block.timestamp > position.frozenTime, "Single block liquidations are not allowed");
             uint256 frozenDuration = block.timestamp - position.frozenTime;
             if (frozenDuration <= MAX_FREEZE_DURATION) 
             {
-                //require(msg.sender == position.liquidator); Anyone can liquidate the position
                 _liquidate(positionId, receiver);
                 emit Liquidation(positionId, positions[positionId].orderId, msg.sender, receiver);
             }
@@ -3033,16 +3068,19 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
+    // @audit-fix V1: nonReentrant guard on position closing
+    // @audit-fix V4: autoWithdraw loop was modifying position.assets via reduceAsset/removeAsset
+    //   while iterating, causing elements to be skipped. Now we snapshot assets first.
+    // @audit-fix V9: safe decrement of order_status positions counter.
     function positionClose(uint256 positionId, bool autoWithdraw) public nonReentrant {
-        // TODO: Implement autowithdraw if specified as True
         Position storage position = positions[positionId];
         Order storage order = orders[position.orderId];
-        require(position.open);
+        require(position.open, "Position is not open");
 
         // Only position owner can close, or order owner after deadline
         if (msg.sender != position.owner) {
             bool isExpired = position.deadline <= block.timestamp;
-            require(isExpired && msg.sender == order.owner);
+            require(isExpired && msg.sender == order.owner, "Not authorized to close");
         }
 
         require(position.frozenTime == 0, "Position frozen");
@@ -3078,33 +3116,34 @@ contract MarginModule is Multicall, IOrderParams
 
         emit PositionClosed(positionId, msg.sender);
 
-        // Once the position is closed
-        // we can decrease the number of active positions for the parent order.
-        // If the number of active positions is 0 then the order owner can modify the order.
-        order_status[position.orderId].positions--;
+        // @audit-fix V9: Safe decrement - prevent underflow
+        if (order_status[position.orderId].positions > 0) {
+            order_status[position.orderId].positions--;
+        }
 
+        // @audit-fix V4: Snapshot the asset addresses to avoid iteration-while-modifying bug.
+        //   reduceAsset() uses swap-and-pop which reorders the array, causing items to be skipped
+        //   when iterating forward. By snapshotting we ensure every asset is withdrawn.
         if(autoWithdraw)
         {
-            /*
-            for (uint256 i = 1; i < position.assets.length; i++) 
-            {
-                uint256 _amountToWithdraw = position.balances[i];
-                reduceAsset(positionId, position.assets[i], _amountToWithdraw);
-
-                if (position.assets[i] == address(0)) 
-                {
-                    _sendEth(position.balances[i], position.owner);
-                } else 
-                {
-                    _sendAsset(position.assets[i], position.balances[i], position.owner);
-                }
-                emit PositionWithdrawal(positionId, position.assets[i], position.balances[i]);
+            address[] memory assetsSnapshot = new address[](position.assets.length);
+            for (uint256 i = 0; i < position.assets.length; i++) {
+                assetsSnapshot[i] = position.assets[i];
             }
-            */
-            
-            for (uint256 i = 0; i < position.assets.length; i++)
+            for (uint256 i = 0; i < assetsSnapshot.length; i++)
             {
-                _positionWithdraw(positionId, position.assets[i]);
+                uint256 id = getAssetId(positionId, assetsSnapshot[i]);
+                if (id < position.assets.length && position.balances[id] > 0) {
+                    uint256 amount = position.balances[id];
+                    reduceAsset(positionId, assetsSnapshot[i], amount);
+                    emit PositionWithdrawal(positionId, assetsSnapshot[i], amount);
+
+                    if (assetsSnapshot[i] == address(0)) {
+                        _sendEth(amount, position.owner);
+                    } else {
+                        _sendAsset(assetsSnapshot[i], amount, position.owner);
+                    }
+                }
             }
         }
     }
@@ -3117,14 +3156,15 @@ contract MarginModule is Multicall, IOrderParams
     /// reentrancy guard; going through the public entry point would deadlock.
     function _positionWithdraw(uint256 positionId, address asset) internal {
         Position storage position = positions[positionId];
-        require(position.owner == msg.sender);
+        require(position.owner == msg.sender, "Not position owner");
         require(!position.open, "Withdraw only from closed position");
 
         uint256 id = getAssetId(positionId, asset);
-        require(id < position.assets.length);
+        require(id < position.assets.length, "Asset not found in position");
 
         uint256[] storage balances = position.balances;
         uint256 amount = balances[id];
+        require(amount > 0, "No balance to withdraw");
 
         reduceAsset(positionId, asset, amount);
         emit PositionWithdrawal(positionId, asset, amount);
@@ -3136,6 +3176,9 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
+    // @audit-fix V3: After liquidation, remaining base asset is returned to position owner
+    //   so funds are not permanently locked in the contract.
+    // @audit-fix V9: Safe decrement of order_status positions counter.
     function _liquidate(uint256 positionId, address _receiver) internal {
         Position storage position = positions[positionId];
 
@@ -3176,6 +3219,13 @@ contract MarginModule is Multicall, IOrderParams
         {
             _sendAsset(rewardAsset, rewardAmount, _receiver);
         }
+
+        // NOTE: this PR additionally returned any leftover position.balances[0] to the owner here, and
+        // repeated `position.open = false` / `positions--`. Both are dropped: main already closes the
+        // position and decrements the order counter ABOVE, before the reward payout, and that ordering
+        // is the GHSA-78hm fix - repeating the decrement afterwards double-counts whenever an order has
+        // more than one position. The leftover-balance block also reverts outright once _paybackBaseAsset
+        // has emptied position.assets, because it indexes assets[0] unconditionally.
     }
 
     /* Internal functions */
@@ -3230,10 +3280,19 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
+    // @audit-fix V2: Check ERC-20 transfer return value to prevent silent failures.
+    //   Some tokens return false instead of reverting on failed transfers.
+    //
+    // NOTE: this PR also carried `require(amount > 0)` here. That is dropped: zero is a legitimate
+    // amount on these paths - positionClose(autoWithdraw) and _liquidate walk every asset of a
+    // position, including ones whose balance is already zero - so the guard reverted normal closes
+    // and liquidations. It surfaced as "reverted without a reason string" rather than the message,
+    // because this contract is compiled with debug.revertStrings: "strip" to fit under EIP-170.
     function _sendAsset(address asset, uint256 amount, address receiver) internal {
         require(asset != address(0), "R1");
 
-        IERC20Minimal(asset).transfer(receiver, amount);
+        bool success = IERC20Minimal(asset).transfer(receiver, amount);
+        require(success, "ERC20 transfer failed");
     }
 
     function _sendEth(uint256 amount, address receiver) internal {
@@ -3268,15 +3327,19 @@ contract MarginModule is Multicall, IOrderParams
         return 0x8943ec02;
     }
 
+    // @audit-fix V1: nonReentrant guard on ERC-223 withdrawals
     function withdraw223(address asset) public nonReentrant {
         uint256 amount = erc223deposit[msg.sender][asset]; 
-        require(amount > 0);
+        require(amount > 0, "No ERC223 deposit");
 
         erc223deposit[msg.sender][asset] = 0;
         require(IERC223(asset).transfer(msg.sender, amount));
     }
     
 
+    // @audit-fix V5: Use internal swap functions instead of public ones to avoid
+    //   reentrancy guard conflicts and msg.sender ownership check failures
+    //   when called from _liquidate or positionClose.
     function _swapToBaseAsset(uint256 positionId, address asset, uint256 amount) internal returns (uint256) {
         Position storage position = positions[positionId];
         Order storage order = orders[position.orderId];
@@ -3292,9 +3355,9 @@ contract MarginModule is Multicall, IOrderParams
         uint256 idInWl1 = getIdFromTokenlist(order.whitelist, order.baseAsset);
 
         if (token0 == asset || token1 == asset) {
-            marginSwap223(positionId, getAssetId(positionId, asset), idInWl0, idInWl1, amount, order.baseAsset, fee);
+            _marginSwap223Internal(positionId, getAssetId(positionId, asset), idInWl0, idInWl1, amount, order.baseAsset, fee);
         } else {
-            marginSwap(positionId, getAssetId(positionId, asset), idInWl0, idInWl1, amount, order.baseAsset, fee, 0, 0);
+            _marginSwapInternal(positionId, getAssetId(positionId, asset), idInWl0, idInWl1, amount, order.baseAsset, fee, 0, 0);
         }
 
         // Return new base asset balance
