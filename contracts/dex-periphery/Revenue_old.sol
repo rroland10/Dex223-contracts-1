@@ -4,7 +4,9 @@ import '../libraries/TransferHelper.sol';
 import '../interfaces/IERC20Minimal.sol';
 import '../dex-core/interfaces/IDex223Factory.sol';
 
-contract Dex223Pool {
+// Renamed from `Dex223Pool`: a second contract of that name shadowed the real
+// contracts/dex-core/Dex223Pool.sol and made every artifact lookup ambiguous (HH701).
+contract Dex223PoolMinimal {
 
     struct Token
     {
@@ -116,19 +118,19 @@ contract Revenue {
     function delivery(address[] calldata pools) public {
         for (uint256 i = 0; i < pools.length; i++) {
             address p = pools[i];
-            //Token memory t0 = Dex223Pool(p).token0();
-            (address t0_20, address t0_223) = Dex223Pool(p).token0();
+            //Token memory t0 = Dex223PoolMinimal(p).token0();
+            (address t0_20, address t0_223) = Dex223PoolMinimal(p).token0();
             if (get20[t0_223] == address(0)) {
                 get223[t0_20] = t0_223;
                 get20[t0_223] = t0_20;
             }
-            (address t1_20, address t1_223) = Dex223Pool(p).token1();
+            (address t1_20, address t1_223) = Dex223PoolMinimal(p).token1();
             if (get20[t1_223] == address(0)) {
                 get223[t1_20] = t1_223;
                 get20[t1_223] = t1_20;
             }
-            (uint128 fees_token0, uint128 fees_token1) = Dex223Pool(p).protocolFees();
-            (uint128 a0, uint128 a1) = Dex223Pool(p).collectProtocol(
+            (uint128 fees_token0, uint128 fees_token1) = Dex223PoolMinimal(p).protocolFees();
+            (uint128 a0, uint128 a1) = Dex223PoolMinimal(p).collectProtocol(
                 address(this),
                 fees_token0,
                 fees_token1,
@@ -229,7 +231,7 @@ contract Revenue {
     {
         for(uint256 i = 0; i < pools.length; i++)
         {
-            Dex223Pool(pools[i]).setFeeProtocol(default_fee_token0, default_fee_token1);
+            Dex223PoolMinimal(pools[i]).setFeeProtocol(default_fee_token0, default_fee_token1);
         }
     }
 }
