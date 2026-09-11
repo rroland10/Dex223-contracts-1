@@ -120,9 +120,14 @@ const config: HardhatUserConfig = {
       // undeployable, while the local network's `allowUnlimitedContractSize` hid that behind a
       // bytecode-size snapshot diff.
       //
-      // runs: 1000 brings it to 23,390 (1,186 bytes spare) at no measured runtime cost: the #mint and
-      // #increaseLiquidity gas snapshots are byte-identical at 5000 and 1000 runs, so the lower setting
-      // trades only rarely-executed code size, which is exactly what this contract needs.
+      // runs: 1000 was the first attempt and still was not enough margin - the PeripheryPayments and
+      // PoolAddress guards (#44) landed 213 bytes over even with it. runs: 500 leaves ~630 bytes spare
+      // with the largest of those branches applied, which is the amount that has actually absorbed an
+      // audit PR in practice.
+      //
+      // The reduction costs nothing measurable at runtime: the #mint and #increaseLiquidity gas
+      // snapshots are byte-identical at 5000, 1000 and 500 runs, so this trades only rarely-executed
+      // code size, which is exactly what this contract needs.
       //
       // NOTE: the `bytecode size` test in test/NonfungiblePositionManager.spec.ts measures
       // MockTimeNonfungiblePositionManager, which lives under contracts/test/ and so does NOT pick up
@@ -136,7 +141,7 @@ const config: HardhatUserConfig = {
         settings: {
           optimizer: {
             enabled: true,
-            runs: 1000,
+            runs: 500,
           }
         }
       },
