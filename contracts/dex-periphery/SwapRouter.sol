@@ -18,6 +18,11 @@ import './base/PeripheryPaymentsWithFee.sol';
 import './base/PoolAddress.sol';
 import './base/CallbackValidation.sol';
 
+interface IERC7417TokenConverter
+{
+    function getERC223WrapperFor(address _token) external view returns (address);
+}
+
 interface IDex223Pool {
     function token0() external view returns (address, address);
     function token1() external view returns (address, address);
@@ -32,8 +37,6 @@ interface IDex223Pool {
 }
 
 abstract contract IERC223Recipient {
-
-
     struct ERC223TransferInfo
     {
         address token_contract;
@@ -41,7 +44,6 @@ abstract contract IERC223Recipient {
         uint256 value;
         bytes   data;
     }
-
     ERC223TransferInfo private tkn;
 
 /**
@@ -83,16 +85,36 @@ IERC223Recipient
     address public call_sender;
     // store ERC223 token on deposit
     address public token_sender;
+
+    IERC7417TokenConverter public ERC7417TokenConverter;
     bool unlocked = true;
 
+    // One-shot permission for the single call that `tokenReceived` delegatecalls into this contract.
+    // `tokenReceived` holds `lock()` for its whole body, so the call it dispatches needs an explicit permit.
+    // The permit is consumed by the first guarded function entered, so the dispatched call cannot re-enter
+    // the router afterwards.
+    bool public erc223CallPermit = false;
+
+    /// @dev `tokenReceived` holds this lock across its entire body so that no router function can run inside
+    /// the context of an ERC-223 deposit - where `call_sender` and `token_sender` still point at the
+    /// depositor and their deposit is still spendable. The one call `tokenReceived` is meant to dispatch is
+    /// let through by the one-shot `erc223CallPermit` rather than by releasing the lock.
     modifier lock() {
-        require(unlocked, 'LOK');
-        unlocked = false;
-        _;
-        unlocked = true;
+        if (erc223CallPermit) {
+            // The payload dispatched by `tokenReceived`. The router is already locked and stays locked for
+            // the duration of this call; consume the permit so this is the only call let through.
+            erc223CallPermit = false;
+            _;
+        } else {
+            require(unlocked, 'LOK');
+            unlocked = false;
+            _;
+            unlocked = true;
+        }
     }
 
     modifier adjustableSender() {
+        
         if (call_sender == address(0))
         {
             call_sender = msg.sender;
@@ -103,7 +125,9 @@ IERC223Recipient
         delete(call_sender);
     }
 
-    constructor(address _factory, address _WETH9) PeripheryImmutableState(_factory, _WETH9) {}
+    constructor(address _factory, address _WETH9, address _converter) PeripheryImmutableState(_factory, _WETH9) {
+        ERC7417TokenConverter = IERC7417TokenConverter(_converter);
+    }
 
     function tokenReceived(address _from, uint _value, bytes memory _data) public override lock returns (bytes4)
     {
@@ -112,8 +136,11 @@ IERC223Recipient
         token_sender = msg.sender;
         if (_data.length != 0)
         {
-            // Standard ERC-223 swapping via ERC-20 pattern
+            // Standard ERC-223 swapping via ERC-20 pattern.
+            // Authorise exactly one guarded call - the one encoded in `_data`.
+            erc223CallPermit = true;
             (bool success, bytes memory _data_) = address(this).delegatecall(_data);
+            erc223CallPermit = false; // clear it in case the payload never consumed it
             require(success, "23F");
 /*
             ERC223SwapStep memory encodedSwaps = abi.decode(_data, (ERC223SwapStep));
@@ -307,10 +334,24 @@ IERC223Recipient
     external
     payable
     override
-    adjustableSender
+    lock
+    adjustableSender()
     checkDeadline(params.deadline)
     returns (uint256 amountOut)
     {
+        if(token_sender != address(0))
+        {
+            // Execution within `tokenReceived` function
+            // Allow only swaps of a token that was deposited in this transaction
+
+            // `msg.sender` here is the ERC-223 token that invoked `tokenReceived`, while callers pass the
+            // ERC-20 address as `tokenIn`. Accept either, exactly as `exactInput` below already does.
+            require(
+                params.tokenIn == msg.sender ||
+                    ERC7417TokenConverter.getERC223WrapperFor(params.tokenIn) == msg.sender,
+                "Wrong token swap requested"
+            );
+        }
         amountOut = exactInputInternal(
             params.amountIn,
             params.recipient,
@@ -339,6 +380,7 @@ IERC223Recipient
     function exactInputDoubleStandard(exactInputDoubleStandardData calldata data)
     external
     payable
+    lock
     adjustableSender
     checkDeadline(data.deadline)
     returns (uint256 amountOut)
@@ -369,10 +411,31 @@ IERC223Recipient
     external
     payable
     override
+    lock
     adjustableSender
     checkDeadline(params.deadline)
     returns (uint256 amountOut)
     {
+        if(token_sender != address(0))
+        {
+            // Execution within `tokenReceived` function
+            // Allow only swaps of a token that was deposited in this transaction
+            //(address _token0_erc20, address _token0_erc223) = IDex223Pool(address(params.path.getFirstPool())).token0();
+            //(address _token1_erc20, address _token1_erc223) = IDex223Pool(params.path.getFirstPool()).token1;
+//decodeFirstPool
+            //bytes memory firstPool = params.path.getFirstPool();
+            (
+                address tokenA,
+                address tokenB,
+                uint24 fee
+            ) = Path.decodeFirstPool(params.path);
+            //address tokenIn = firstPool.toAddress(0);
+
+            // Swappable token has to be either
+            // the token which is being deposited
+            // or its ERC-223 version.
+            require(tokenA == msg.sender || ERC7417TokenConverter.getERC223WrapperFor(tokenA) == msg.sender, "Token doesnt match ERC223 versions");
+        }
         address payer = call_sender; //msg.sender; // msg.sender pays for the first hop
 
         while (true) {
@@ -444,6 +507,7 @@ IERC223Recipient
     external
     payable
     override
+    lock
     checkDeadline(params.deadline)
     returns (uint256 amountIn)
     {
@@ -465,6 +529,7 @@ IERC223Recipient
     external
     payable
     override
+    lock
     checkDeadline(params.deadline)
     returns (uint256 amountIn)
     {
