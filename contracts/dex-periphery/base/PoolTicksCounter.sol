@@ -34,19 +34,19 @@ library PoolTicksCounter {
             // preserves the sign of the dividend (e.g., (-5) % 256 == -5), which produces
             // incorrect bitPos when cast to uint8. We use _compress() to get a
             // floor-divided compressed tick and _position() to safely split it.
-            int24 compressedBefore = _compress(tickBefore, spacing);
-            int24 compressedAfter = _compress(tickAfter, spacing);
-
-            // [FIX V-03] Safe wordPos/bitPos computation that avoids int16 truncation
-            (int16 wordPos, uint8 bitPos) = _position(compressedBefore);
-            (int16 wordPosAfter, uint8 bitPosAfter) = _position(compressedAfter);
+            // [FIX V-03] Safe wordPos/bitPos computation that avoids int16 truncation.
+            // The compressed ticks are inlined into _position rather than held in their own
+            // locals: this block is at the EVM's 16-slot stack reach, and keeping them live
+            // across the tickBitmap reads below puts it over (stack too deep).
+            (int16 wordPos, uint8 bitPos) = _position(_compress(tickBefore, spacing));
+            (int16 wordPosAfter, uint8 bitPosAfter) = _position(_compress(tickAfter, spacing));
 
             // In the case where tickAfter is initialized, we only want to count it if we are
             // swapping downwards. If the initializable tick after the swap is initialized, our
             // original tickAfter is a multiple of tick spacing, and we are swapping downwards we
             // know that tickAfter is initialized and we shouldn't count it.
             tickAfterInitialized =
-                ((self.tickBitmap(wordPosAfter) & (1 << bitPosAfter)) > 0) &&
+                _isTickInitialized(self, wordPosAfter, bitPosAfter) &&
                 ((tickAfter % spacing) == 0) &&
                 (tickBefore > tickAfter);
 
@@ -54,7 +54,7 @@ library PoolTicksCounter {
             // swapping upwards. Use the same logic as above to decide whether we should count
             // tickBefore or not.
             tickBeforeInitialized =
-                ((self.tickBitmap(wordPos) & (1 << bitPos)) > 0) &&
+                _isTickInitialized(self, wordPos, bitPos) &&
                 ((tickBefore % spacing) == 0) &&
                 (tickBefore < tickAfter);
 
@@ -105,6 +105,18 @@ library PoolTicksCounter {
         }
 
         return initializedTicksCrossed;
+    }
+
+    /// @dev Whether the tick addressed by (wordPos, bitPos) is set in the pool's bitmap.
+    ///      Kept as its own function deliberately: countInitializedTicksCrossed sits at the
+    ///      EVM's 16-slot stack reach, and performing these two bitmap reads inline puts it
+    ///      over ("stack too deep"). Calling out gives each read a fresh frame.
+    function _isTickInitialized(
+        IUniswapV3Pool self,
+        int16 wordPos,
+        uint8 bitPos
+    ) private view returns (bool) {
+        return (self.tickBitmap(wordPos) & (uint256(1) << bitPos)) > 0;
     }
 
     /// @dev Compresses a tick by the spacing using floor division.
