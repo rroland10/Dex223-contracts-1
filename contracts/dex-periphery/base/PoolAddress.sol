@@ -3,7 +3,11 @@ pragma solidity >=0.5.0;
 
 /// @title Provides functions for deriving a pool address from the factory, tokens, and the fee
 library PoolAddress {
-    bytes32 internal constant POOL_INIT_CODE_HASH = 0x2ed8d490a5fd6b96b6fc965619c116f0c4dba73ee522cfc1bb2a714f08eae839; // Updated for 0.7.6 compiled version with 5000 runs (EVM version Prague)
+    // keccak256(type(Dex223Pool).creationCode), for solc 0.7.6, optimizer on, 5000 runs, EVM istanbul.
+    // MUST be regenerated whenever Dex223Pool.sol or the compiler settings change, otherwise every
+    // periphery contract computes the wrong pool address and all pool lookups silently fail:
+    //   node -e "console.log(require('ethers').keccak256(require('./artifacts/contracts/dex-core/Dex223Pool.sol/Dex223Pool.json').bytecode))"
+    bytes32 internal constant POOL_INIT_CODE_HASH = 0xabf7c759cff8bc5f1daacce9b8f8a6af58787959776f39af35a8ca6e799be3ee;
     /// @notice The identifying key of the pool
     struct PoolKey {
         address token0;

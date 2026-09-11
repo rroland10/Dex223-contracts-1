@@ -340,10 +340,12 @@ describe('SwapRouter gas tests', function () {
         prefer223Out: false
       }
 
+      // NOTE: `sweepToken` was deliberately removed from PeripheryPayments ("inconsistency with the
+      // ERC-223 workflow") - on an ERC-223 wrapper it would transfer balance that belongs to users'
+      // tracked `_erc223Deposits`. The output therefore stays custodied by the router here.
       const data = [
         router.interface.encodeFunctionData('exactInput', [swap0]),
         router.interface.encodeFunctionData('exactInput', [swap1]),
-        router.interface.encodeFunctionData('sweepToken', [tokens[0].target.toString(), 2, trader.address]),
       ]
 
       await snapshotGasCost(router.connect(trader).multicall(data))
