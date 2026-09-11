@@ -113,12 +113,30 @@ const config: HardhatUserConfig = {
           }
         }
       },
+      // NonfungiblePositionManager is the largest deployable contract in the repo and was the closest
+      // to the EIP-170 limit: at runs: 5000 it compiled to 24,241 bytes, leaving 335 bytes of headroom.
+      // That is not enough room to accept any further change - both the PoolInitializer validation (#45)
+      // and the LiquidityManagement/LiquidityAmounts guards (#41) pushed it over 24,576 and made it
+      // undeployable, while the local network's `allowUnlimitedContractSize` hid that behind a
+      // bytecode-size snapshot diff.
+      //
+      // runs: 1000 brings it to 23,390 (1,186 bytes spare) at no measured runtime cost: the #mint and
+      // #increaseLiquidity gas snapshots are byte-identical at 5000 and 1000 runs, so the lower setting
+      // trades only rarely-executed code size, which is exactly what this contract needs.
+      //
+      // NOTE: the `bytecode size` test in test/NonfungiblePositionManager.spec.ts measures
+      // MockTimeNonfungiblePositionManager, which lives under contracts/test/ and so does NOT pick up
+      // this override. That snapshot therefore does not track the deployable contract's size - it stays
+      // at 24,329 regardless of what this setting does. Use the script below for the real number.
+      //
+      // Re-check with `npx hardhat run scripts/check-contract-sizes.ts` before raising this, and use
+      // `ENFORCE_SIZE_LIMIT=1 npx hardhat test` to make the local network apply the real limit.
       "contracts/dex-periphery/NonfungiblePositionManager.sol": {
         version: "0.7.6",
         settings: {
           optimizer: {
             enabled: true,
-            runs: 5000,
+            runs: 1000,
           }
         }
       },
