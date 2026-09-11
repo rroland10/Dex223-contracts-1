@@ -172,6 +172,29 @@ const config: HardhatUserConfig = {
           }
         }
       },
+      // Mirror the NonfungiblePositionManager setting above onto its MockTime subclass.
+      //
+      // Without this the mock compiles at the default runs: 5000 while the real contract is at 500,
+      // so it is ~900 bytes larger and carries no relation to what actually ships. Two consequences,
+      // both of which cost real time in the #41/#44/#45 audit PRs:
+      //
+      //   - `it('bytecode size')` in test/NonfungiblePositionManager.spec.ts measures the MOCK, so the
+      //     snapshot tracked neither the deployable contract's size nor its deployability. Every one of
+      //     those PRs shipped an over-limit contract that looked like a harmless snapshot diff.
+      //   - `ENFORCE_SIZE_LIMIT=1 npx hardhat test` failed on the mock while every deployable contract
+      //     had headroom, which made the one command that catches this class of bug unusable in CI.
+      //
+      // With the settings matched, the snapshot moves with the real contract and ENFORCE_SIZE_LIMIT=1
+      // is a meaningful gate. Keep this in sync whenever the override above changes.
+      "contracts/test/MockTimeNonfungiblePositionManager.sol": {
+        version: "0.7.6",
+        settings: {
+          optimizer: {
+            enabled: true,
+            runs: 500,
+          }
+        }
+      },
       // These need their own solc; without them `hardhat compile` fails outright.
       "contracts/dex-periphery/RevenueV1.sol": {
         version: "0.8.19",
