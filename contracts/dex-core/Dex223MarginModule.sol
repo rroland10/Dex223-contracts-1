@@ -2087,16 +2087,21 @@ contract MarginModule is Multicall, IOrderParams
     uint256 public orderIndex;
     uint256 public positionIndex;
 
-    // @audit-fix V1: Reentrancy guard to prevent reentrant calls during ETH transfers
-    uint256 private constant _NOT_ENTERED = 1;
-    uint256 private constant _ENTERED = 2;
-    uint256 private _reentrancyStatus = _NOT_ENTERED;
+    // Reentrancy guard. Every fund-moving entry point below hands control to untrusted code at some
+    // point - `_receiveAsset` pulls a caller-chosen token, `_sendAsset` on an ERC-223 asset invokes the
+    // recipient's `tokenReceived`, and `_sendEth` uses call{value:} with all gas.
+    //
+    // NOTE: `marginSwap` / `marginSwap223` are deliberately NOT guarded: `_liquidate` reaches them via
+    // `_swapToBaseAsset`, so guarding them would deadlock liquidation. That path is already covered
+    // because `liquidate()` itself holds the guard. A top-level `marginSwap` is restricted to the
+    // position owner or its liquidator.
+    bool private _entered;
 
     modifier nonReentrant() {
-        require(_reentrancyStatus != _ENTERED, "ReentrancyGuard: reentrant call");
-        _reentrancyStatus = _ENTERED;
+        require(!_entered, "REENTRANCY");
+        _entered = true;
         _;
-        _reentrancyStatus = _NOT_ENTERED;
+        _entered = false;
     }
 
     event OrderCreated(
@@ -2289,8 +2294,12 @@ contract MarginModule is Multicall, IOrderParams
         router = ISwapRouter(_router);
     }
 
-    // @audit-fix V10: Contract must be able to receive ETH for ETH-based collateral/orders
-    receive() external payable {}
+    // NOTE: deliberately no `receive()`. Every ETH inflow already arrives through a payable entry
+    // point that credits an order or position - orderDepositEth and orderDepositWETH9 - and nothing
+    // here unwraps WETH back into bare ETH (orderDepositWETH9 only ever calls deposit()). A bare
+    // `receive()` would accept ETH that no order or position is credited for, leaving it stranded,
+    // and it also makes `MarginModule(address)` a compile error at every call site in this file
+    // because the type gains a payable fallback.
 
     function getPositionActualPools(uint256 _positionId, uint24[] memory _feeTiers) public view returns (address[] memory _pools)
     {
@@ -2465,7 +2474,7 @@ contract MarginModule is Multicall, IOrderParams
         emit OrderModified(_orderId, msg.sender, order.baseAsset, _whitelist, _interestRate, _duration, _minLoan, _leverage, _oracle);
     }
 
-    function orderDepositEth(uint256 _orderId) public payable onlyOrderOwner(_orderId) {
+    function orderDepositEth(uint256 _orderId) public payable nonReentrant onlyOrderOwner(_orderId) {
         require(isOrderOpen(_orderId), "Order is expired");
         require(orders[_orderId].baseAsset == address(0));
 
@@ -2488,7 +2497,7 @@ contract MarginModule is Multicall, IOrderParams
         emit OrderDeposit(_orderId, address(0), _balanceDelta);
     }
 
-    function orderDepositToken(uint256 _orderId, uint256 amount) public onlyOrderOwner(_orderId) {
+    function orderDepositToken(uint256 _orderId, uint256 amount) public nonReentrant onlyOrderOwner(_orderId) {
         require(isOrderOpen(_orderId), "Order is expired");
         require(orders[_orderId].baseAsset != address(0));
 
@@ -2506,10 +2515,15 @@ contract MarginModule is Multicall, IOrderParams
         return isActivated && isNotExpired && order_status[id].alive;
     }
 
-    // @audit-fix V7: Added nonReentrant guard and active-positions check to prevent
-    //                 draining order funds while borrowers depend on them.
+    // @audit-fix V7: nonReentrant guard, and a balance check that carries a reason.
+    //
+    // NOTE: this PR also required order_status[_orderId].positions == 0 here, to stop order funds
+    // being drained while borrowers depend on them. That is dropped: taking a loan already debits
+    // orders[_orderId].balance, so whatever balance remains is unlent and free to withdraw - the
+    // lender is not touching borrowed capital. Requiring zero open positions would instead lock a
+    // lender out of their own uncommitted funds for as long as any position stays open, and it
+    // breaks the existing guard-release test, which withdraws while two positions are live.
     function orderWithdraw(uint256 _orderId, uint256 amount) public nonReentrant onlyOrderOwner(_orderId) {
-        require(order_status[_orderId].positions == 0, "Cannot withdraw while positions are active");
         require(orders[_orderId].balance >= amount, "Insufficient order balance");
 
         orders[_orderId].balance -= amount;
@@ -2523,7 +2537,7 @@ contract MarginModule is Multicall, IOrderParams
     }
 
     // TODO: Anyone can deposit funds to a position, not only the owner of the position.
-    function positionDeposit(uint256 positionId, address asset, uint256 idInWhitelist,  uint256 amount) public {
+    function positionDeposit(uint256 positionId, address asset, uint256 idInWhitelist,  uint256 amount) public nonReentrant {
         require(positions[positionId].owner == msg.sender, "Only the owner can deposit into this position");
         require(amount > 0, "Deposit must exceed zero");
 
@@ -2659,55 +2673,67 @@ contract MarginModule is Multicall, IOrderParams
             0,
             address(0));
 
-        positionInitialCollateral[positionIndex] = order.collateralAssets[_collateralIdx];
-        positions[positionIndex] = _newPosition;
+        // SECURITY: claim this position's id and advance the counter BEFORE the _receiveAsset calls
+        // below. Those pull a caller-chosen collateral / reward asset, so a malicious token can hand
+        // control back here (ERC-20 transferFrom, or an ERC-223 tokenReceived hook) and re-enter
+        // takeLoan. `positionIndex` used to be incremented only as the final statement of this
+        // function, so the nested call reused the same id: it overwrote positions[id], appended its
+        // assets onto the same record via addAsset(), and debited order.balance a second time.
+        uint256 _positionId = positionIndex;
+        positionIndex++;
+
+        positionInitialCollateral[_positionId] = order.collateralAssets[_collateralIdx];
+        positions[_positionId] = _newPosition;
 
         order.balance -= _amount;
-        addAsset(positionIndex, order.baseAsset, _amount);
-        addAsset(positionIndex, order.collateralAssets[_collateralIdx], _collateralAmount);
+        addAsset(_positionId, order.baseAsset, _amount);
+        addAsset(_positionId, order.collateralAssets[_collateralIdx], _collateralAmount);
 
-        uint256 receivedEth = msg.value;
+        // Scoped so receivedEth / rewardAmount / rewardAsset are released before the emits below;
+        // without this the extra `_positionId` local pushes the function over the EVM stack limit.
+        {
+            uint256 receivedEth = msg.value;
 
-        // Deposit collateral
-        // In case the collateral asset is Ether
-        if (order.collateralAssets[_collateralIdx] == address(0)) {
-            require(receivedEth >= _collateralAmount, "ETH reception error");
-            receivedEth -= _collateralAmount;
-        // or ERC-20
-        } else {
-            _receiveAsset(order.collateralAssets[_collateralIdx], _collateralAmount);
-        }
+            // Deposit collateral
+            // In case the collateral asset is Ether
+            if (order.collateralAssets[_collateralIdx] == address(0)) {
+                require(receivedEth >= _collateralAmount, "ETH reception error");
+                receivedEth -= _collateralAmount;
+            // or ERC-20
+            } else {
+                _receiveAsset(order.collateralAssets[_collateralIdx], _collateralAmount);
+            }
 
-        // Deposit the liquidation reward
-        // In case the reward asset is Ether
-        (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(_orderId);
-        if (rewardAsset == address(0)) {
-            require(receivedEth >= rewardAmount, "ETH reward reception error");
-            receivedEth -= rewardAmount;
-        // or ERC-20
-        } else {
-            _receiveAsset(rewardAsset, rewardAmount);
+            // Deposit the liquidation reward
+            // In case the reward asset is Ether
+            (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(_orderId);
+            if (rewardAsset == address(0)) {
+                require(receivedEth >= rewardAmount, "ETH reward reception error");
+                receivedEth -= rewardAmount;
+            // or ERC-20
+            } else {
+                _receiveAsset(rewardAsset, rewardAmount);
+            }
         }
 
         // Make sure position is not subject to liquidation right after it was created.
         // Revert otherwise.
         // This automatically checks if all the collateral that was paid satisfies the criteria set by the lender.
 
-        require(!subjectToLiquidation(positionIndex), "Position is immediately exposed to liquidation");
+        require(!subjectToLiquidation(_positionId), "Position is immediately exposed to liquidation");
 
         // Increment the amount of active positions associated with the parent order,
         // we are tracking the active positions to make sure that the Order owner
         // will not modify an Order that has any active positins.
         order_status[_orderId].positions++;
 
-        emit PositionOpened(positionIndex, msg.sender, _amount, order.baseAsset, order.collateralAssets[_collateralIdx], _collateralAmount);
-        emit InitialLeverage(positionIndex, ((collateralEquivalentInBaseAsset + _amount) / collateralEquivalentInBaseAsset));
-        emit NewAsset(positionIndex, order.baseAsset);
+        emit PositionOpened(_positionId, msg.sender, _amount, order.baseAsset, order.collateralAssets[_collateralIdx], _collateralAmount);
+        emit InitialLeverage(_positionId, ((collateralEquivalentInBaseAsset + _amount) / collateralEquivalentInBaseAsset));
+        emit NewAsset(_positionId, order.baseAsset);
         if (order.collateralAssets[_collateralIdx] != order.baseAsset)
         {
-            emit NewAsset(positionIndex, order.collateralAssets[_collateralIdx]);
+            emit NewAsset(_positionId, order.collateralAssets[_collateralIdx]);
         }
-        positionIndex++;
     }
 
     // @audit-fix V1: nonReentrant guard on margin swaps
@@ -3122,8 +3148,13 @@ contract MarginModule is Multicall, IOrderParams
         }
     }
 
-    // @audit-fix V1: nonReentrant guard on position withdrawals
     function positionWithdraw(uint256 positionId, address asset) public nonReentrant {
+        _positionWithdraw(positionId, asset);
+    }
+
+    /// @dev Body of positionWithdraw. positionClose() calls this directly because it already holds the
+    /// reentrancy guard; going through the public entry point would deadlock.
+    function _positionWithdraw(uint256 positionId, address asset) internal {
         Position storage position = positions[positionId];
         require(position.owner == msg.sender, "Not position owner");
         require(!position.open, "Withdraw only from closed position");
@@ -3161,6 +3192,23 @@ contract MarginModule is Multicall, IOrderParams
         }
         _paybackBaseAsset(position);
 
+        // SECURITY: close the position and update the parent order BEFORE paying the liquidation
+        // reward. The reward goes to a caller-supplied `_receiver` (see liquidate(positionId, receiver)),
+        // and both payout paths hand control to it - `_sendEth` uses call{value:} with all gas, and
+        // `_sendAsset` on an ERC-223 asset invokes the recipient's `tokenReceived`. With the flags set
+        // afterwards, that receiver could re-enter liquidate(): `position.open` was still true and
+        // `subjectToLiquidation` still returned true (the assets have been swapped away and the base
+        // balance zeroed by _paybackBaseAsset, while calculateDebtAmount still reports the full debt
+        // because initialBalance is never reduced), so the reward was paid again on every re-entry, and
+        // `positions--` underflowed - permanently blocking modifyOrder/orderSetCollaterals, which
+        // require positions == 0. positionClose() already uses this ordering.
+        position.open = false;
+
+        // Once the position is liquidated
+        // we can decrease the number of active positions for the parent order.
+        // If the number of active positions is 0 then the order owner can modify the order.
+        order_status[position.orderId].positions--;
+
         // Payment of liquidation reward
         (uint256 rewardAmount, address rewardAsset, ) = getOrderExpirationData(position.orderId);
         if (rewardAsset == address(0)) 
@@ -3172,25 +3220,12 @@ contract MarginModule is Multicall, IOrderParams
             _sendAsset(rewardAsset, rewardAmount, _receiver);
         }
 
-        // @audit-fix V3: Return any remaining base asset balance to position owner
-        //   After debt repayment and reward payout, leftover funds belong to the borrower.
-        if (position.balances[0] > 0) {
-            uint256 remainingBalance = position.balances[0];
-            position.balances[0] = 0;
-            address baseAsset = position.assets[0];
-            if (baseAsset == address(0)) {
-                _sendEth(remainingBalance, position.owner);
-            } else {
-                _sendAsset(baseAsset, remainingBalance, position.owner);
-            }
-        }
-
-        position.open = false;
-
-        // @audit-fix V9: Safe decrement - prevent underflow
-        if (order_status[position.orderId].positions > 0) {
-            order_status[position.orderId].positions--;
-        }
+        // NOTE: this PR additionally returned any leftover position.balances[0] to the owner here, and
+        // repeated `position.open = false` / `positions--`. Both are dropped: main already closes the
+        // position and decrements the order counter ABOVE, before the reward payout, and that ordering
+        // is the GHSA-78hm fix - repeating the decrement afterwards double-counts whenever an order has
+        // more than one position. The leftover-balance block also reverts outright once _paybackBaseAsset
+        // has emptied position.assets, because it indexes assets[0] unconditionally.
     }
 
     /* Internal functions */
@@ -3247,9 +3282,14 @@ contract MarginModule is Multicall, IOrderParams
 
     // @audit-fix V2: Check ERC-20 transfer return value to prevent silent failures.
     //   Some tokens return false instead of reverting on failed transfers.
+    //
+    // NOTE: this PR also carried `require(amount > 0)` here. That is dropped: zero is a legitimate
+    // amount on these paths - positionClose(autoWithdraw) and _liquidate walk every asset of a
+    // position, including ones whose balance is already zero - so the guard reverted normal closes
+    // and liquidations. It surfaced as "reverted without a reason string" rather than the message,
+    // because this contract is compiled with debug.revertStrings: "strip" to fit under EIP-170.
     function _sendAsset(address asset, uint256 amount, address receiver) internal {
         require(asset != address(0), "R1");
-        require(amount > 0, "Zero transfer amount");
 
         bool success = IERC20Minimal(asset).transfer(receiver, amount);
         require(success, "ERC20 transfer failed");
