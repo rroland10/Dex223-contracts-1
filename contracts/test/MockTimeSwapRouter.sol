@@ -7,7 +7,7 @@ import '../dex-periphery/SwapRouter.sol';
 contract MockTimeSwapRouter is ERC223SwapRouter {
     uint256 public time;
 
-    constructor(address _factory, address _WETH9) ERC223SwapRouter(_factory, _WETH9) {}
+    constructor(address _factory, address _WETH9, address _converter) ERC223SwapRouter(_factory, _WETH9, _converter) {}
 
     function _blockTimestamp() internal view override returns (uint32) {
         return uint32(time);

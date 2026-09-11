@@ -13,23 +13,11 @@ import './PeripheryImmutableState.sol';
 ///         external call is made to the factory or pool contracts.
 abstract contract PoolInitializer is IPoolInitializer, PeripheryImmutableState {
 
-    /// @notice Emitted when a pool is created and/or initialized through this contract
-    /// @param pool The address of the pool
-    /// @param token0_20 The ERC-20 address of token0
-    /// @param token1_20 The ERC-20 address of token1
-    /// @param fee The pool fee tier
-    /// @param sqrtPriceX96 The initial sqrt price (only meaningful when the pool was initialized)
-    /// @param created True if the pool was newly created, false if it already existed
-    /// @param initialized True if the pool was initialized in this call
-    event PoolCreatedAndInitialized(
-        address indexed pool,
-        address indexed token0_20,
-        address indexed token1_20,
-        uint24 fee,
-        uint160 sqrtPriceX96,
-        bool created,
-        bool initialized
-    );
+    // NOTE: this contract deliberately emits no event of its own. Pool creation is already announced
+    // by Dex223Factory's `PoolCreated` and initialization by the pool's own `Initialize`, so a
+    // combined event here would duplicate on-chain information at a permanent cost in both bytecode
+    // and per-call gas - and NonfungiblePositionManager, which inherits this, has the least size
+    // headroom of any deployable contract in the repo. See #50.
 
     /// @inheritdoc IPoolInitializer
     /// @dev Validates all inputs before making external calls:
@@ -47,14 +35,14 @@ abstract contract PoolInitializer is IPoolInitializer, PeripheryImmutableState {
     ) external payable override returns (address pool) {
         // --- Input validation ------------------------------------------------
 
-        // V1: Zero-address checks for all token parameters
-        require(token0_20  != address(0), 'PI: ZERO_TOKEN0_20');
-        require(token1_20  != address(0), 'PI: ZERO_TOKEN1_20');
-        require(token0_223 != address(0), 'PI: ZERO_TOKEN0_223');
-        require(token1_223 != address(0), 'PI: ZERO_TOKEN1_223');
-
-        // V2: Canonical ordering – token0 must sort before token1
+        // V1+V2: Canonical ordering, which also rules out a zero token1_20: token0_20 < token1_20
+        // forces token1_20 > token0_20 >= 0, so a separate non-zero check on token1_20 would be
+        // dead code. token0_20 still needs its own check - ordering alone permits it to be zero.
         require(token0_20 < token1_20, 'PI: TOKEN_ORDER');
+        require(token0_20 != address(0), 'PI: ZERO_TOKEN0_20');
+
+        // ERC-223 addresses must both be set, or the pool is silently misconfigured.
+        require(token0_223 != address(0) && token1_223 != address(0), 'PI: ZERO_TOKEN_223');
 
         // V3: Initial price must be valid (zero is not a legal Q64.96 price)
         require(sqrtPriceX96 > 0, 'PI: ZERO_PRICE');
@@ -63,26 +51,16 @@ abstract contract PoolInitializer is IPoolInitializer, PeripheryImmutableState {
 
         pool = IDex223Factory(factory).getPool(token0_20, token1_20, fee);
 
-        bool created;
-        bool initialized;
-
         if (pool == address(0)) {
             pool = IDex223Factory(factory).createPool(
                 token0_20, token1_20, token0_223, token1_223, fee
             );
             IUniswapV3Pool(pool).initialize(sqrtPriceX96);
-            created     = true;
-            initialized = true;
         } else {
             (uint160 sqrtPriceX96Existing, , , , , , ) = IUniswapV3Pool(pool).slot0();
             if (sqrtPriceX96Existing == 0) {
                 IUniswapV3Pool(pool).initialize(sqrtPriceX96);
-                initialized = true;
             }
         }
-
-        emit PoolCreatedAndInitialized(
-            pool, token0_20, token1_20, fee, sqrtPriceX96, created, initialized
-        );
     }
 }
