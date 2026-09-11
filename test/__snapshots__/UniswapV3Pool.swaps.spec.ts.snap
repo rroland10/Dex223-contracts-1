@@ -3625,7 +3625,7 @@ Object {
   "poolBalance0": "1",
   "poolBalance1": "26087635650665564424699143612505016738",
   "poolPriceBefore": "1.7014e+38",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": 880340n,
 }
 `;
@@ -3723,7 +3723,7 @@ Object {
   "poolBalance0": "26037782196502120275425782622539039026",
   "poolBalance1": "1",
   "poolPriceBefore": "0.0000000000000000000000000000000000000059000",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": -880303n,
 }
 `;
@@ -3957,7 +3957,7 @@ Object {
   "poolBalance0": "0",
   "poolBalance1": "36796311329002736532545403775337522448",
   "poolPriceBefore": "3.4026e+38",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": 887271n,
 }
 `;
@@ -3999,7 +3999,7 @@ Object {
   "poolBalance0": "0",
   "poolBalance1": "36796311329002736532545403775337522448",
   "poolPriceBefore": "3.4026e+38",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": 887271n,
 }
 `;
@@ -4009,7 +4009,7 @@ Object {
   "poolBalance0": "0",
   "poolBalance1": "36796311329002736532545403775337522448",
   "poolPriceBefore": "3.4026e+38",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": 887271n,
 }
 `;
@@ -4059,7 +4059,7 @@ Object {
   "poolBalance0": "36796311322104302062438284732106019258",
   "poolBalance1": "0",
   "poolPriceBefore": "0.0000000000000000000000000000000000000029390",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": -887272n,
 }
 `;
@@ -4085,7 +4085,7 @@ Object {
   "poolBalance0": "36796311322104302062438284732106019258",
   "poolBalance1": "0",
   "poolPriceBefore": "0.0000000000000000000000000000000000000029390",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": -887272n,
 }
 `;
@@ -4095,7 +4095,7 @@ Object {
   "poolBalance0": "36796311322104302062438284732106019258",
   "poolBalance1": "0",
   "poolPriceBefore": "0.0000000000000000000000000000000000000029390",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": -887272n,
 }
 `;
@@ -5005,7 +5005,7 @@ Object {
   "poolBalance0": "6324555320336758664",
   "poolBalance1": "632455532033675867",
   "poolPriceBefore": "0.10000",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": -23028n,
 }
 `;
@@ -5167,7 +5167,7 @@ Object {
   "poolBalance0": "632455532033675867",
   "poolBalance1": "6324555320336758664",
   "poolPriceBefore": "10.000",
-  "swapError": "VM Exception while processing transaction: reverted with reason string '23F'",
+  "swapError": "reverted with reason string '23F'",
   "tickBefore": 23027n,
 }
 `;

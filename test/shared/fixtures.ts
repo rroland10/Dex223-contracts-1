@@ -46,6 +46,7 @@ export async function listingFixture(): Promise<ListingFixture> {
 interface FactoryFixture {
   factory: Dex223Factory,
   library: MockTimeDex223PoolLib,
+  quoteLibrary: any,
   converter: TokenStandardConverter
 }
 
@@ -53,15 +54,21 @@ export async function factoryFixture(): Promise<FactoryFixture> {
   const libraryFactory = await ethers.getContractFactory('MockTimeDex223PoolLib')
   const library = (await libraryFactory.deploy())
 
+  const quoteLibraryFactory = await ethers.getContractFactory('Dex223QuoteLib')
+  const quoteLibrary = (await quoteLibraryFactory.deploy())
+
   const converterFactory = await ethers.getContractFactory('TokenStandardConverter')
   const converter = (await converterFactory.deploy())
 
+  const validatorFactory = await ethers.getContractFactory('Dex223TokenValidator')
+  const validator = (await validatorFactory.deploy())
+
   const factoryFactory = await ethers.getContractFactory('Dex223Factory')
-  const factory = (await factoryFactory.deploy()) as Dex223Factory
+  const factory = (await factoryFactory.deploy(validator.target)) as Dex223Factory
 
-  await factory.set(library.target, converter.target)
+  await factory.set(library.target, quoteLibrary.target, converter.target)
 
-  return { factory, library, converter }
+  return { factory, library, quoteLibrary, converter }
 }
 
 interface TokensFixture {

@@ -198,7 +198,7 @@ describe('Dex223Pool', () => {
       
       // convert tokenA ERC-20 to ERC-223
       await (await converter.createERC223Wrapper(tokenA.target)).wait();
-      let tokenA223 = (await converter.getERC223WrapperFor(tokenA.target))[0];
+      let tokenA223 = await converter.getERC223WrapperFor(tokenA.target);
       let tokenB223 = await converter.predictWrapperAddress(tokenB.target, true);
 
       await expect(factory.createPool(tokenA.target, tokenB.target, tokenA223, tokenB223, 3000n)).not.to.be.reverted;
@@ -215,7 +215,7 @@ describe('Dex223Pool', () => {
 
       // convert tokenA ERC-223 to ERC-20
       await (await converter.createERC20Wrapper(tokenA_223.target)).wait();
-      let tokenA_20 = (await converter.getERC20WrapperFor(tokenA_223.target))[0];
+      let tokenA_20 = await converter.getERC20WrapperFor(tokenA_223.target);
       let tokenB223 = await converter.predictWrapperAddress(tokenB.target, true);
 
       await expect(factory.createPool(tokenA_20, tokenB.target, tokenA_223.target, tokenB223, 3000n)).not.to.be.reverted;
