@@ -70,7 +70,9 @@ contract Dex223PoolLib {
     }
     Slot0 public  slot0;
 
-    bool public erc223ReentrancyLock = false;
+    // Layout placeholder matching Dex223Pool.erc223CallPermit (formerly erc223ReentrancyLock).
+    // Unused here, but the slot must line up: Dex223Pool delegatecalls into this contract.
+    bool public erc223CallPermit = false;
 
     uint256 public  feeGrowthGlobal0X128;
     uint256 public  feeGrowthGlobal1X128;

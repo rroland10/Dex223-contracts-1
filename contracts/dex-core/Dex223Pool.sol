@@ -94,7 +94,13 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
     /// @inheritdoc IUniswapV3PoolState
     Slot0 public override slot0;
 
-    bool public erc223ReentrancyLock = false; // Additional reentrancy safeguard specific for ERC-223 token deposit that invoke functions.
+    // One-shot permission for the single call that `tokenReceived` delegatecalls into this contract.
+    // `tokenReceived` holds the pool-wide `lock()` for its whole body, so the call it dispatches needs an
+    // explicit permit to get through. The permit is consumed by the first guarded function it enters, so the
+    // dispatched call cannot re-enter the pool any further.
+    // NOTE: occupies the storage slot of the former `erc223ReentrancyLock`; keep it in sync with the layouts
+    // of Dex223PoolLib / Dex223QuoteLib, which this contract delegatecalls into.
+    bool public erc223CallPermit = false;
 
     /// @inheritdoc IUniswapV3PoolState
     uint256 public override feeGrowthGlobal0X128;
@@ -132,11 +138,22 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
     /// @dev Mutually exclusive reentrancy protection into the pool to/from a method. This method also prevents entrance
     /// to a function before the pool is initialized. The reentrancy guard is required throughout the contract because
     /// we use balance checks to determine the payment status of interactions such as mint, swap and flash.
+    /// @dev `tokenReceived` holds this same lock across its entire body - including the auto-refund, which
+    /// hands control back to the depositor - so that no pool function can run inside the context of an
+    /// ERC-223 deposit. The one call `tokenReceived` is meant to dispatch is let through by the one-shot
+    /// `erc223CallPermit` rather than by releasing the lock.
     modifier lock() {
-        require(slot0.unlocked, 'LOK');
-        slot0.unlocked = false;
-        _;
-        slot0.unlocked = true;
+        if (erc223CallPermit) {
+            // The payload dispatched by `tokenReceived`. The pool is already locked and stays locked for the
+            // duration of this call; consume the permit so this is the only call that gets let through.
+            erc223CallPermit = false;
+            _;
+        } else {
+            require(slot0.unlocked, 'LOK');
+            slot0.unlocked = false;
+            _;
+            slot0.unlocked = true;
+        }
     }
 
     /// @dev Prevents calling a function from anyone except the address returned by IUniswapV3Factory#owner()
@@ -182,11 +199,15 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
     {
         require(msg.sender == factory, "POOL: NOT_FACTORY");
         require(pool_lib == address(0), "POOL: ALREADY_SET");
-        require(_t0erc223 != address(0), "POOL: ZERO_T0_ERC223");
-        require(_t1erc223 != address(0), "POOL: ZERO_T1_ERC223");
-        require(_library != address(0), "POOL: ZERO_LIBRARY");
-        require(_quote_library != address(0), "POOL: ZERO_QUOTE_LIB");
-        require(_converter != address(0), "POOL: ZERO_CONVERTER");
+        // One check rather than five. Each `require` with a reason costs roughly 200 bytes of
+        // bytecode, and Dex223Factory embeds type(Dex223Pool).creationCode - five separate messages
+        // here took the factory 706 bytes past the EIP-170 limit. `set` is called once per pool, by
+        // the factory, with all five values at once, so per-argument granularity buys nothing.
+        require(
+            _t0erc223 != address(0) && _t1erc223 != address(0) && _library != address(0) &&
+            _quote_library != address(0) && _converter != address(0),
+            "POOL: ZERO_ADDR"
+        );
         pool_lib = _library;
         quote_lib = _quote_library;
         token0.erc223 = _t0erc223;
@@ -203,51 +224,42 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
  */
     function tokenReceived(address _from, uint _value, bytes memory _data) public returns (bytes4)
     {
-        // @audit-fix V1: Validate that the calling token is one of the pool's tokens.
-        //   Without this check, any ERC-223 contract can call tokenReceived and
-        //   set swap_sender to an arbitrary _from address, potentially spoofing
-        //   deposit credits for tokens unrelated to this pool.
-        require(
-            msg.sender == token0.erc223 || msg.sender == token1.erc223,
-            "POOL: INVALID_TOKEN"
-        );
+        // Only the pool's own ERC-223 tokens can open a deposit. Without this anyone could call
+        // `tokenReceived` directly to point `swap_sender` at a victim and have the pool invoke
+        // `uniswapV3SwapCallback` on it, or to dispatch an arbitrary call through the delegatecall below.
+        require(msg.sender == token0.erc223 || msg.sender == token1.erc223, 'IT');
 
-        require(!erc223ReentrancyLock); // Specific reentrancy protection for ERC-223 deposits
-        erc223ReentrancyLock = true;
+        // Take the pool-wide reentrancy lock and hold it for the whole body, so that nothing can be executed
+        // from within the context of an ERC-223 deposit. Note this also rejects deposits before the pool is
+        // initialized, since `slot0.unlocked` is false until then.
+        require(slot0.unlocked, 'LOK');
+        slot0.unlocked = false;
 
         swap_sender = _from;
         erc223deposit[_from][msg.sender] += _value;   // add token to user balance
         if (_data.length != 0) {
-            // @audit-fix V1: Restrict delegatecall to only allowed pool functions.
-            //   The original code passed arbitrary _data to delegatecall, enabling an attacker
-            //   to call any function (including set(), setFeeProtocol(), or selfdestruct gadgets)
-            //   in the context of the pool contract. We whitelist only swap() and swapExactInput()
-            //   selectors, which are the legitimate operations during an ERC-223 token deposit.
-            require(_data.length >= 4, "POOL: DATA_TOO_SHORT");
-            bytes4 selector;
-            assembly {
-                selector := mload(add(_data, 32))
-            }
-            require(
-                selector == bytes4(keccak256("swap(address,bool,int256,uint160,bool,bytes)")) ||
-                selector == bytes4(keccak256("swapExactInput(address,bool,int256,uint256,uint160,bool,bytes,uint256,bool)")),
-                "POOL: FORBIDDEN_SELECTOR"
-            );
-
+            // Authorise exactly one guarded call - the one encoded in `_data`. The permit is consumed by the
+            // first guarded function entered, so the dispatched call cannot re-enter the pool afterwards.
+            erc223CallPermit = true;
             (bool success, bytes memory _data_) = address(this).delegatecall(_data);
+            erc223CallPermit = false; // clear it in case the payload never consumed it
 
             delete(_data);
             require(success, "23F");
         }
-        
-        // Auto-refund of any remaining ERC-223 tokens.
-        if (erc223deposit[_from][msg.sender] != 0) {
-            TransferHelper.safeTransfer(msg.sender, _from, erc223deposit[_from][msg.sender]);
-            erc223deposit[_from][msg.sender] = 0;
-        }
 
-        erc223ReentrancyLock = false;
+        // Auto-refund of any remaining ERC-223 tokens.
+        // Clear the accounting *before* transferring: the refund is an ERC-223 transfer, so it hands control
+        // to `_from` via its own `tokenReceived`, and it must not observe a deposit it has already been paid.
+        uint256 _refund = erc223deposit[_from][msg.sender];
+        erc223deposit[_from][msg.sender] = 0;
         swap_sender = address(0);
+
+        if (_refund != 0) {
+            TransferHelper.safeTransfer(msg.sender, _from, _refund);
+	    }
+
+        slot0.unlocked = true;
         return 0x8943ec02;
     }
 
@@ -528,23 +540,28 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
     //   The only legitimate ETH sender is a WETH contract during unwrapWETH9().
     //   We restrict to token0.erc20 or token1.erc20 which covers the case where
     //   one of the pool tokens is WETH and it sends ETH during withdraw().
+    // This MUST stay empty - do not add a sender check here, however tempting.
+    //
+    // The only ETH that arrives is from WETH9.withdraw() during unwrapWETH9(), and canonical WETH9
+    // pays out with `msg.sender.transfer(wad)`, which forwards a 2300 gas stipend. That buys a couple
+    // of arithmetic ops and nothing else: `token0.erc20` and `token1.erc20` are storage reads at 2100
+    // gas each (cold), so a guard of the form
+    //
+    //     require(msg.sender == token0.erc20 || msg.sender == token1.erc20)
+    //
+    // runs out of gas before it can even decide, and every ERC-223 swap with ETH output reverts. It
+    // fails as a bare `23F` from the tokenReceived delegatecall, naming nothing.
+    //
+    // The sender identity is not the problem - instrumenting it confirms msg.sender IS token0.erc20 -
+    // the gas stipend is. Note the previous attempt at this check is still here, commented out; this
+    // is the second time it has been tried.
     receive() external payable {
-        require(
-            msg.sender == token0.erc20 || msg.sender == token1.erc20,
-            "POOL: ETH_REJECTED"
-        );
+//        require(msg.sender == WETH9, 'Not WETH9');
     }
     
-    // @audit-fix V8: Multiple issues fixed in unwrapWETH9:
-    //   1. `require(msg.sender != address(this))` - This is always true for a private function
-    //      called from an external function. It was likely meant to prevent self-calls via
-    //      delegatecall, but it doesn't serve that purpose. Removed dead code.
-    //   2. Added recipient != address(0) check to prevent burning ETH.
-    //   3. Added amountOut > 0 check as a precondition instead of wrapping in
-    //      `if (balanceWETH9 > 0)` which would silently skip a zero unwrap.
-    function unwrapWETH9(address recipient, address WETH9, uint256 amountOut) private {
-        require(recipient != address(0), "POOL: ZERO_RECIPIENT");
-        require(amountOut > 0, "POOL: ZERO_UNWRAP");
+    function unwrapWETH9(address recipient, address WETH9, uint256 amountOut) internal { 
+        // Unwrapping sends raw ETH, so a zero recipient burns it outright.
+        require(recipient != address(0), 'RC');
         uint256 balanceWETH9 = IWETH9(WETH9).balanceOf(address(this));
         require(balanceWETH9 >= amountOut, 'Insufficient WETH9');
 

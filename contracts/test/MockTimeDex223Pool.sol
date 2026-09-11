@@ -29,7 +29,7 @@ contract MockTimeDex223Pool is Dex223Pool {
         uint160 sqrtPriceLimitX96,
         bool prefer223,
         bytes memory data
-    ) external override adjustableSender // noDelegateCall will not prevent delegatecalling
+    ) external override lock adjustableSender // noDelegateCall will not prevent delegatecalling
         // this method from the same contract via `tokenReceived` of ERC-223
     returns (int256 amount0, int256 amount1) {
 
@@ -63,7 +63,7 @@ contract MockTimeDex223Pool is Dex223Pool {
         bytes memory data,
         uint256 deadline,
         bool unwrapETH
-    ) external override checkDeadline(deadline) returns (uint256 amountOut) {
+    ) external override lock checkDeadline(deadline) returns (uint256 amountOut) {
         (bool success, bytes memory retdata) = pool_lib.delegatecall(
             abi.encodeWithSignature("swap(address,bool,int256,uint160,bool,bytes)",
                 unwrapETH ? address(this) : recipient, zeroForOne, amountSpecified, sqrtPriceLimitX96,
