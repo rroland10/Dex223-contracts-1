@@ -33,7 +33,8 @@ export async function v3RouterFixture(): Promise<RouterFixture> {
   const routerFactory = await ethers.getContractFactory('MockTimeSwapRouter')
   const router = (await routerFactory.deploy(
       factory.target.toString(),
-      weth9.target.toString()
+      weth9.target.toString(),
+      converter.target.toString()
   )) as MockTimeSwapRouter
 
   return { factory, weth9, router , converter }
