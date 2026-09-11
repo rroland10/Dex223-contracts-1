@@ -14,7 +14,7 @@ import './Dex223TokenValidator.sol';
 
 /// @title Canonical Uniswap V3 factory
 /// @notice Deploys Uniswap V3 pools and manages ownership and control over pool protocol fees
-contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall {
+contract Dex223Factory is IDex223Factory, Dex223PoolDeployer, NoDelegateCall {
     // @inheritdoc IUniswapV3Factory
     address public override owner;
 

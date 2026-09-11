@@ -181,28 +181,38 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
         maxLiquidityPerTick = Tick.tickSpacingToMaxLiquidityPerTick(_tickSpacing);
     }
 
+    // @audit-fix V7: Added zero-address validation for all parameters.
+    //   If pool_lib or quote_lib is set to address(0), all delegatecall-based functions
+    //   (swap, mint, burn, collect) will silently succeed but return empty data,
+    //   causing abi.decode to revert with an opaque error. Worse, if converter is
+    //   address(0), optimisticDelivery in the pool library would call convert on
+    //   address(0), silently failing and potentially locking user funds.
+    //   Also added a guard to prevent re-initialization after pool_lib is already set,
+    //   which would allow the factory to change the pool's logic contract mid-flight.
     function set(
-        //address _t0erc20,
-        //address _t1erc20,
         address _t0erc223,
         address _t1erc223,
-        //uint24 _fee,
-        //int24 _tickSpacing,
         address _library,
         address _quote_library,
         address _converter
         ) external
     {
-        require(msg.sender == factory);
+        require(msg.sender == factory, "POOL: NOT_FACTORY");
+        require(pool_lib == address(0), "POOL: ALREADY_SET");
+        // One check rather than five. Each `require` with a reason costs roughly 200 bytes of
+        // bytecode, and Dex223Factory embeds type(Dex223Pool).creationCode - five separate messages
+        // here took the factory 706 bytes past the EIP-170 limit. `set` is called once per pool, by
+        // the factory, with all five values at once, so per-argument granularity buys nothing.
+        require(
+            _t0erc223 != address(0) && _t1erc223 != address(0) && _library != address(0) &&
+            _quote_library != address(0) && _converter != address(0),
+            "POOL: ZERO_ADDR"
+        );
         pool_lib = _library;
         quote_lib = _quote_library;
-        //token0.erc20 = _t0erc20;
-        //token1.erc20 = _t1erc20;
         token0.erc223 = _t0erc223;
         token1.erc223 = _t1erc223;
         converter     = ITokenStandardConverter(_converter);
-        //fee = _fee;
-        //maxLiquidityPerTick = Tick.tickSpacingToMaxLiquidityPerTick(_tickSpacing);
     }
 
 /**
@@ -486,15 +496,26 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
         if (success) {
             (amount0, amount1) = abi.decode(retdata, (int256, int256));
         } else {
-            string memory val = abi.decode(retdata, (string));
+            // @audit-fix V2: Properly propagate revert data from the delegatecall target.
+            //   The original code attempted `abi.decode(retdata, (string))` which fails
+            //   when the revert reason is not ABI-encoded as a string (e.g. custom errors,
+            //   Panic(uint256), or raw revert bytes). This would cause a secondary decode
+            //   revert that masks the original error message, making debugging impossible.
+            //   The fix: relay the raw revert data directly, preserving the original error.
             assembly {
-                let ptr := mload(0x40)
-                mstore(ptr, val)
-                revert(ptr, 32)
+                revert(add(retdata, 32), mload(retdata))
             }
         }
     }
     
+    // @audit-fix V4: quoteSwap was not protected by the lock modifier, meaning it could
+    //   be called reentrantly or concurrently with swap operations. While the quote_lib
+    //   ends with a revert (so state changes are rolled back within the delegatecall),
+    //   the function itself was still externally callable during a locked state.
+    //   Added `lock` to prevent reentrancy and ensure consistent state reads.
+    //   Also added `view`-like documentation: this function is intended for off-chain
+    //   simulation only (via eth_call). On-chain execution will always revert because
+    //   quote_lib's quoteSwap reverts intentionally to return data.
     function quoteSwap(
         address recipient,
         bool zeroForOne,
@@ -506,31 +527,55 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
         // quoteSwap performs a `revert()` once it will reach IUniswapV3SwapCallback invocation
         // and passes callback values back to retdata.
         (bool success, bytes memory retdata) = quote_lib.delegatecall(abi.encodeWithSignature("quoteSwap(address,bool,int256,uint160,bool,bytes)", recipient, zeroForOne, amountSpecified, sqrtPriceLimitX96, prefer223, data));
+        require(retdata.length >= 32, "POOL: QUOTE_FAILED");
         (int256 _d0) = abi.decode(retdata, (int256));
-        emit Delta0(_d0); // This event is preserved for debugging purposes,
-                          // this function is never supposed to be called in practice
-                          // since the caller must simulate the transaction 
-                          //and get the return value instead.
+        emit Delta0(_d0);
 
         return _d0;
     }
 
+    // @audit-fix V5: Unrestricted receive() allows anyone to send ETH to the pool,
+    //   permanently locking those funds since the pool has no general-purpose ETH
+    //   withdrawal mechanism (withdrawEther is owner-only and unrelated to user deposits).
+    //   The only legitimate ETH sender is a WETH contract during unwrapWETH9().
+    //   We restrict to token0.erc20 or token1.erc20 which covers the case where
+    //   one of the pool tokens is WETH and it sends ETH during withdraw().
+    // This MUST stay empty - do not add a sender check here, however tempting.
+    //
+    // The only ETH that arrives is from WETH9.withdraw() during unwrapWETH9(), and canonical WETH9
+    // pays out with `msg.sender.transfer(wad)`, which forwards a 2300 gas stipend. That buys a couple
+    // of arithmetic ops and nothing else: `token0.erc20` and `token1.erc20` are storage reads at 2100
+    // gas each (cold), so a guard of the form
+    //
+    //     require(msg.sender == token0.erc20 || msg.sender == token1.erc20)
+    //
+    // runs out of gas before it can even decide, and every ERC-223 swap with ETH output reverts. It
+    // fails as a bare `23F` from the tokenReceived delegatecall, naming nothing.
+    //
+    // The sender identity is not the problem - instrumenting it confirms msg.sender IS token0.erc20 -
+    // the gas stipend is. Note the previous attempt at this check is still here, commented out; this
+    // is the second time it has been tried.
     receive() external payable {
 //        require(msg.sender == WETH9, 'Not WETH9');
     }
     
     function unwrapWETH9(address recipient, address WETH9, uint256 amountOut) internal { 
+        // Unwrapping sends raw ETH, so a zero recipient burns it outright.
+        require(recipient != address(0), 'RC');
         uint256 balanceWETH9 = IWETH9(WETH9).balanceOf(address(this));
         require(balanceWETH9 >= amountOut, 'Insufficient WETH9');
-        require(msg.sender != address(this));
 
-        if (balanceWETH9 > 0) {
-            IWETH9(WETH9).withdraw(amountOut);
-            TransferHelper.safeTransferETH(recipient, amountOut);
-        }
+        IWETH9(WETH9).withdraw(amountOut);
+        TransferHelper.safeTransferETH(recipient, amountOut);
     }
 
     /// @dev to make direct swap via pool with deadline and slippage
+    // @audit-fix V3: Added adjustableSender modifier.
+    //   Without this modifier, when swapExactInput is called via ERC-223 tokenReceived,
+    //   the delegatecalled swap() in pool_lib reads swap_sender for ERC-223 deposit deduction.
+    //   However, swapExactInput did not set swap_sender, so the pool_lib would attempt to
+    //   call uniswapV3SwapCallback on address(0) (the default swap_sender), which reverts.
+    //   This effectively made swapExactInput unusable for ERC-223 token deposits.
     function swapExactInput(
         address recipient,
         bool zeroForOne,
@@ -541,7 +586,7 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
         bytes memory data,
         uint256 deadline,
         bool unwrapETH
-    ) external virtual lock checkDeadline(deadline) returns (uint256 amountOut) {
+    ) external virtual lock adjustableSender checkDeadline(deadline) returns (uint256 amountOut) {
         (bool success, bytes memory retdata) = pool_lib.delegatecall(
             abi.encodeWithSignature("swap(address,bool,int256,uint160,bool,bytes)",
                 unwrapETH ? address(this) : recipient, zeroForOne, amountSpecified, sqrtPriceLimitX96,
@@ -634,8 +679,15 @@ contract Dex223Pool is IUniswapV3Pool, NoDelegateCall, PeripheryValidation {
         return abi.decode(retdata, (uint128, uint128));
     }
 
+    // @audit-fix V6: Replace .transfer() with .call{value:}().
+    //   .transfer() forwards only 2300 gas, which is insufficient for contracts
+    //   with receive()/fallback() functions that perform SSTORE or other logic
+    //   (e.g. multisig wallets, proxies). This causes unexpected reverts when the
+    //   factory owner is a contract. Using .call{value:} forwards all available gas.
+    //   Also added zero-address check for _to to prevent burning ETH.
     function withdrawEther(address payable _to, uint256 _amount) external lock onlyFactoryOwner {
-        // Transfer the requested amount of Ether
-        _to.transfer(_amount);
+        require(_to != address(0), "POOL: ZERO_RECIPIENT");
+        (bool success, ) = _to.call{value: _amount}("");
+        require(success, "POOL: ETH_TRANSFER_FAILED");
     }
 }

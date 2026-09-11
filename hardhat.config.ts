@@ -193,13 +193,28 @@ const config: HardhatUserConfig = {
       // Lowering runs here is cheap: Dex223Pool is a thin delegatecall dispatcher, and the swap math it
       // forwards to (Dex223PoolLib) stays at runs: 5000. Changing either value changes the pool
       // bytecode, so POOL_INIT_CODE_HASH in dex-periphery/base/PoolAddress.sol must be regenerated.
+      // WARNING: revert strings are STRIPPED from both of these. `require(cond, "POOL: ZERO_ADDR")`
+      // in the source produces a bare revert on chain with no reason data - the message you read in
+      // the source is NOT what a caller sees. Do not spend time adding descriptive messages here
+      // expecting them to surface; put user-facing validation in Dex223TokenValidator instead, which
+      // keeps its strings. Same treatment as Dex223MarginModule, for the same reason.
+      //
+      // It is needed because the pool's audit hardening (#36) added ~13 `require`s, and each one with
+      // a reason costs roughly 200 bytes. Dex223Factory embeds type(Dex223Pool).creationCode, so pool
+      // growth hits the factory twice over: the factory reached 25,282 bytes, 706 past the EIP-170
+      // limit. Stripping brings it to 22,239 with 2,337 to spare.
+      //
+      // The two MUST keep identical settings - `debug` included, not just `optimizer`. Different
+      // settings put them in different compilation jobs, which changes the pool bytecode the factory
+      // actually deploys while the standalone Dex223Pool artifact says otherwise, so
+      // POOL_INIT_CODE_HASH silently stops matching and every derived pool address misses.
       "contracts/dex-core/Dex223Pool.sol": {
         version: "0.7.6",
-        settings: { optimizer: { enabled: true, runs: 1 } }
+        settings: { optimizer: { enabled: true, runs: 1 }, debug: { revertStrings: "strip" } }
       },
       "contracts/dex-core/Dex223Factory.sol": {
         version: "0.7.6",
-        settings: { optimizer: { enabled: true, runs: 1 } }
+        settings: { optimizer: { enabled: true, runs: 1 }, debug: { revertStrings: "strip" } }
       },
       "contracts/dex-core/Dex223MarginModule.sol": {
         version: "0.7.6",
