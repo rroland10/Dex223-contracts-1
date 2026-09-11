@@ -34,7 +34,10 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
 
     function set(address _lib, address _quote, address _converter) public
     {
-        require(msg.sender == owner);
+        require(msg.sender == owner, "FACTORY: NOT_OWNER");
+        require(_lib != address(0), "FACTORY: ZERO_LIB");
+        require(_quote != address(0), "FACTORY: ZERO_QUOTE");
+        require(_converter != address(0), "FACTORY: ZERO_CONVERTER");
         converter = ITokenStandardConverter(_converter);
         pool_lib = _lib;
         quote_lib = _quote;
@@ -70,11 +73,12 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         uint24 fee
     ) external override noDelegateCall returns (address payable pool) {
 
-        require(tokenA_erc20 != tokenB_erc20);
-        require(tokenA_erc20 != address(0));
-        require(tokenB_erc20 != address(0));
-        require(tokenA_erc223 != address(0));
-        require(tokenB_erc223 != address(0));
+        /// @dev Delegated to Dex223TokenValidator for the same reason identifyTokens is: these checks
+        /// carry descriptive revert strings, and inline they take this factory 315 bytes over EIP-170.
+        Dex223TokenValidator(tokenValidator).validateCreatePool(
+            tokenA_erc20, tokenB_erc20, tokenA_erc223, tokenB_erc223,
+            pool_lib, quote_lib, address(converter)
+        );
 
         // pool correctness safety checks via Converter.
         // identifyTokens(..) function attempts to call the `standard` function of the examinable token
@@ -99,8 +103,8 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         }
 
         int24 tickSpacing = feeAmountTickSpacing[fee];
-        require(tickSpacing != 0);
-        require(getPool[tokenA_erc20][tokenB_erc20][fee] == address(0));
+        require(tickSpacing != 0, "FACTORY: INVALID_FEE");
+        require(getPool[tokenA_erc20][tokenB_erc20][fee] == address(0), "FACTORY: POOL_EXISTS");
         pool = payable(deploy(address(this), tokenA_erc20, tokenB_erc20, fee, tickSpacing));
         Dex223Pool(pool).set(tokenA_erc223, tokenB_erc223, pool_lib, quote_lib, address(converter));
         getPool[tokenA_erc20][tokenB_erc20][fee] = pool;
@@ -117,7 +121,8 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
 
     // @inheritdoc IUniswapV3Factory
     function setOwner(address _owner) external override {
-        require(msg.sender == owner);
+        require(msg.sender == owner, "FACTORY: NOT_OWNER");
+        require(_owner != address(0), "FACTORY: ZERO_OWNER");
         emit OwnerChanged(owner, _owner);
         owner = _owner;
     }
@@ -131,13 +136,13 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
 
     // @inheritdoc IUniswapV3Factory
     function enableFeeAmount(uint24 fee, int24 tickSpacing) public override {
-        require(msg.sender == owner);
-        require(fee < 1000000);
+        require(msg.sender == owner, "FACTORY: NOT_OWNER");
+        require(fee < 1000000, "FACTORY: FEE_TOO_LARGE");
         // tick spacing is capped at 16384 to prevent the situation where tickSpacing is so large that
         // TickBitmap#nextInitializedTickWithinOneWord overflows int24 container from a valid tick
         // 16384 ticks represents a >5x price change with ticks of 1 bips
-        require(tickSpacing > 0 && tickSpacing < 16384);
-        require(feeAmountTickSpacing[fee] == 0);
+        require(tickSpacing > 0 && tickSpacing < 16384, "FACTORY: INVALID_TICK_SPACING");
+        require(feeAmountTickSpacing[fee] == 0, "FACTORY: FEE_ALREADY_ENABLED");
 
         feeAmountTickSpacing[fee] = tickSpacing;
         emit FeeAmountEnabled(fee, tickSpacing);

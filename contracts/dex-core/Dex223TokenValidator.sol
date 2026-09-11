@@ -10,6 +10,43 @@ import '../interfaces/ITokenConverter.sol';
 /// every `require` are exactly as they were in the factory.
 contract Dex223TokenValidator {
 
+    /// @notice Validates the inputs to Dex223Factory.createPool.
+    /// @dev Lives here rather than in the factory for the same reason identifyTokens does: the factory
+    /// embeds `type(Dex223Pool).creationCode` and has only ~1.6KB of its own room under EIP-170. These
+    /// checks carry descriptive revert strings, and revert strings are expensive - keeping them inline
+    /// in the factory took it to 24,891 bytes, 315 over the limit and undeployable. Moving them here
+    /// costs one external call per createPool and keeps both the checks and their messages.
+    function validateCreatePool(
+        address tokenA_erc20,
+        address tokenB_erc20,
+        address tokenA_erc223,
+        address tokenB_erc223,
+        address pool_lib,
+        address quote_lib,
+        address _converter
+    ) external pure {
+        require(tokenA_erc20 != tokenB_erc20, "FACTORY: IDENTICAL_ERC20");
+        require(tokenA_erc223 != tokenB_erc223, "FACTORY: IDENTICAL_ERC223");
+        require(tokenA_erc20 != address(0), "FACTORY: ZERO_TOKEN_A_ERC20");
+        require(tokenB_erc20 != address(0), "FACTORY: ZERO_TOKEN_B_ERC20");
+        require(tokenA_erc223 != address(0), "FACTORY: ZERO_TOKEN_A_ERC223");
+        require(tokenB_erc223 != address(0), "FACTORY: ZERO_TOKEN_B_ERC223");
+
+        // Prevent pool creation before the factory is fully configured. If pool_lib/quote_lib are zero
+        // the pool's delegatecall-based functions (swap, mint, burn, collect) silently succeed and do
+        // nothing, leaving a permanently broken pool that blocks future creation for the same pair+fee.
+        require(pool_lib != address(0), "FACTORY: LIB_NOT_SET");
+        require(quote_lib != address(0), "FACTORY: QUOTE_NOT_SET");
+        require(_converter != address(0), "FACTORY: CONVERTER_NOT_SET");
+
+        // Prevent address overlaps between the ERC-20 and ERC-223 sides. getPool is populated in every
+        // direction, so an address serving as both standards would produce conflicting entries.
+        require(tokenA_erc20 != tokenA_erc223, "FACTORY: A_ERC20_EQ_A_ERC223");
+        require(tokenB_erc20 != tokenB_erc223, "FACTORY: B_ERC20_EQ_B_ERC223");
+        require(tokenA_erc20 != tokenB_erc223, "FACTORY: A_ERC20_EQ_B_ERC223");
+        require(tokenB_erc20 != tokenA_erc223, "FACTORY: B_ERC20_EQ_A_ERC223");
+    }
+
     /// @dev Reverts if the pair is not a valid ERC-20 / ERC-223 pairing. `_converter` is passed in by
     /// the caller so this contract stays stateless and the factory keeps control of which converter is
     /// authoritative.
@@ -44,17 +81,23 @@ contract Dex223TokenValidator {
 
 
         // In any scenario _token MUST NOT be a ERC-223 token.
+        // NOTE: this MUST stay a `call`, not a `staticcall`. The probe deliberately tolerates the token
+        // handling `standard()` in its fallback, and some real ERC-20s write state there - WETH9's
+        // fallback runs deposit(). Under STATICCALL a state write is an exceptional halt that consumes
+        // ALL gas forwarded to the sub-call (63/64 of what is left), so probing WETH9 does not fail
+        // cleanly, it drains the transaction: every WETH9 pool path dies with "out of gas".
         (bool success, bytes memory data) = _token.call(abi.encodeWithSelector(0x5a3b7e42)); // call `standard() returns uint32`
         // It is important to note that the call may be handled by the fallback function
         // of the token contract.
         // In this case it will succeed but the returned `data` will be empty.
-                
+
         // Make sure that `standard()` call fails or returns something other than 223 for _token.
         // Note that if there is a fallback function in the token contract
         // then it MAY handle the `standard()` call.
         require(!success              // The call failed i.e. token doesn't implement `standard()` func.
                 //|| abi.decode(data,(uint32)) != uint32(223) // The token implements `standard()` and it responds that it is not ERC-223.
-                || data.length == 0); // The call was handled by the fallback function of the token.
+                || data.length == 0,  // The call was handled by the fallback function of the token.
+                "FACTORY: ERC20_IS_ERC223");
 
         // `isWrapper` only recognises wrappers that already exist on chain. When an ERC-223 origin exists but
         // its ERC-20 wrapper has not been created yet (scenario 2 with a not-yet-deployed wrapper), the
