@@ -30,16 +30,22 @@ describe('Dex223Factory', () => {
     const libraryFactory = await ethers.getContractFactory('MockTimeDex223PoolLib')
     const library = (await libraryFactory.deploy());
 
+    const quoteLibraryFactory = await ethers.getContractFactory('Dex223QuoteLib')
+    const quoteLibrary = (await quoteLibraryFactory.deploy());
+
     const converterFactory = await ethers.getContractFactory('TokenStandardConverter')
     const converter = (await converterFactory.deploy());
 
+    const validatorFactory = await ethers.getContractFactory('Dex223TokenValidator')
+    const validator = (await validatorFactory.deploy());
+
     const factoryFactory = await ethers.getContractFactory('Dex223Factory')
-    const factory =  (await factoryFactory.deploy()) as Dex223Factory;
+    const factory =  (await factoryFactory.deploy(validator.target)) as Dex223Factory;
 
     TEST_ADDRESSES[2] = await converter.predictWrapperAddress(TEST_ADDRESSES[0], true);
     TEST_ADDRESSES[3] = await converter.predictWrapperAddress(TEST_ADDRESSES[1], true);
 
-    await factory.set(library.target, converter.target);
+    await factory.set(library.target, quoteLibrary.target, converter.target);
     
     return factory;
   }

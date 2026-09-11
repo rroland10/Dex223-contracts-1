@@ -676,7 +676,9 @@ describe('SwapRouter', function () {
             //    
             // );
 
-            const deadline = Math.floor(new Date().getTime() / 1000 + 100);
+            // Derive the deadline from chain time, not the host clock: the pool checks it against
+        // `block.timestamp`, and preceding specs advance the chain well past `Date.now() + 100`.
+        const deadline = (await ethers.provider.getBlock('latest'))!.timestamp + 3600;
             await expect(swap223(pool, tokens[3], [3n, 1n], trader.address, undefined, undefined, BigInt(deadline), true))
               .to.emit(weth9, 'Withdrawal')
               .withArgs(pool, 1);
@@ -838,7 +840,9 @@ describe('SwapRouter', function () {
         // console.log(poolBefore);
         // console.log(traderBefore);
 
-        const deadline = Math.floor(new Date().getTime() / 1000 + 100);
+        // Derive the deadline from chain time, not the host clock: the pool checks it against
+        // `block.timestamp`, and preceding specs advance the chain well past `Date.now() + 100`.
+        const deadline = (await ethers.provider.getBlock('latest'))!.timestamp + 3600;
         await swap223(pool, tokens[3], [123456n, 0n], trader.address, undefined, undefined, BigInt(deadline));
 
         // get balances after
