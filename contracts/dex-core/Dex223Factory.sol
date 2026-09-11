@@ -10,6 +10,7 @@ import './Dex223PoolDeployer.sol';
 import './NoDelegateCall.sol';
 
 import './Dex223Pool.sol';
+import './Dex223TokenValidator.sol';
 
 /// @title Canonical Uniswap V3 factory
 /// @notice Deploys Uniswap V3 pools and manages ownership and control over pool protocol fees
@@ -20,10 +21,11 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
     address public pool_lib;
     address public quote_lib;
 
-    ITokenStandardIntrospection public standardIntrospection;
-    address public tokenReceivedCaller;
 
     ITokenStandardConverter public converter;
+
+    /// @dev External token-pair validator; see Dex223TokenValidator.
+    address public immutable tokenValidator;
 
     // @inheritdoc IUniswapV3Factory
     mapping(uint24 => int24) public override feeAmountTickSpacing;
@@ -41,7 +43,9 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         quote_lib = _quote;
     }
 
-    constructor() {
+    constructor(address _tokenValidator) {
+        require(_tokenValidator != address(0));
+        tokenValidator = _tokenValidator;
         owner = msg.sender;
         converter = ITokenStandardConverter(0xe7E969012557f25bECddB717A3aa2f4789ba9f9a);
         emit OwnerChanged(address(0), msg.sender);
@@ -53,13 +57,10 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         emit FeeAmountEnabled(10000, 200);
     }
 
-    function tokenReceived(address _from, uint _value, bytes memory ) public returns (bytes4)
+    /// @dev Accepts ERC-223 transfers so they do not revert. The factory holds no balances and the
+    /// former `tokenReceivedCaller` bookkeeping was write-only, so nothing is recorded here.
+    function tokenReceived(address, uint, bytes memory) public pure returns (bytes4)
     {
-        // Only allow state mutation when called by the factory itself during
-        // token identification (prevents external callers from polluting
-        // tokenReceivedCaller state).
-        require(_from == address(this) && _value == 0, "FACTORY: INVALID_TOKEN_RECEIVED");
-        tokenReceivedCaller = msg.sender;
         return 0x8943ec02;
     }
 
@@ -72,29 +73,12 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         uint24 fee
     ) external override noDelegateCall returns (address payable pool) {
 
-        require(tokenA_erc20 != tokenB_erc20, "FACTORY: IDENTICAL_ERC20");
-        require(tokenA_erc223 != tokenB_erc223, "FACTORY: IDENTICAL_ERC223");
-        require(tokenA_erc20 != address(0), "FACTORY: ZERO_TOKEN_A_ERC20");
-        require(tokenB_erc20 != address(0), "FACTORY: ZERO_TOKEN_B_ERC20");
-        require(tokenA_erc223 != address(0), "FACTORY: ZERO_TOKEN_A_ERC223");
-        require(tokenB_erc223 != address(0), "FACTORY: ZERO_TOKEN_B_ERC223");
-
-        // Prevent pool creation before factory is fully configured.
-        // If pool_lib/quote_lib are zero, the pool's delegatecall-based functions
-        // (swap, mint, burn, collect) will silently succeed but do nothing,
-        // resulting in a permanently broken pool that blocks future pool creation
-        // for the same token pair + fee.
-        require(pool_lib != address(0), "FACTORY: LIB_NOT_SET");
-        require(quote_lib != address(0), "FACTORY: QUOTE_NOT_SET");
-        require(address(converter) != address(0), "FACTORY: CONVERTER_NOT_SET");
-
-        // Prevent address overlaps between ERC-20 and ERC-223 token addresses.
-        // If any ERC-20 address equals an ERC-223 address from the other pair,
-        // the getPool mapping could contain conflicting entries.
-        require(tokenA_erc20 != tokenA_erc223, "FACTORY: A_ERC20_EQ_A_ERC223");
-        require(tokenB_erc20 != tokenB_erc223, "FACTORY: B_ERC20_EQ_B_ERC223");
-        require(tokenA_erc20 != tokenB_erc223, "FACTORY: A_ERC20_EQ_B_ERC223");
-        require(tokenB_erc20 != tokenA_erc223, "FACTORY: B_ERC20_EQ_A_ERC223");
+        /// @dev Delegated to Dex223TokenValidator for the same reason identifyTokens is: these checks
+        /// carry descriptive revert strings, and inline they take this factory 315 bytes over EIP-170.
+        Dex223TokenValidator(tokenValidator).validateCreatePool(
+            tokenA_erc20, tokenB_erc20, tokenA_erc223, tokenB_erc223,
+            pool_lib, quote_lib, address(converter)
+        );
 
         // pool correctness safety checks via Converter.
         // identifyTokens(..) function attempts to call the `standard` function of the examinable token
@@ -133,7 +117,6 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         getPool[tokenB_erc223][tokenA_erc223][fee] = pool;
         getPool[tokenB_erc223][tokenA_erc20][fee] = pool;
         emit PoolCreated(tokenA_erc20, tokenB_erc20, tokenA_erc223, tokenB_erc223, fee, tickSpacing, pool);
-        tokenReceivedCaller = address(0);
     }
 
     // @inheritdoc IUniswapV3Factory
@@ -144,125 +127,10 @@ contract Dex223Factory is IDex223Factory, UniswapV3PoolDeployer, NoDelegateCall 
         owner = _owner;
     }
 
-    function identifyTokens(address _token, address _token223) internal view
+    /// @dev Delegated to an external contract to keep this factory under the EIP-170 size limit.
+    function identifyTokens(address _token, address _token223) internal
     {
-        // This function checks the correctness of provided tokens and it must prevent the creation of incorrect pools.
-        //
-        // Identifying which standard each of the provided token addresses supports.
-        // The problem is that there is no reliable method of token standard introspection,
-        // ERC-165 is unreliable at identifying a token standard.
-        //
-        // We assume that one of the provided token addresses MUST be created via converter.
-        //
-        // Converter does not know/verify which token is a valid origin,
-        // i.e. it is possible to take an existing ERC-20 token like USDT
-        // throw it in the converter and create a ERC-20-Wrapper for an existing ERC-20 token
-        // then pretend that this ERC-20 token is a ERC-223 origin and input it to the Dex223 Factory
-        // where the Converter will confirm that there is a ERC-20-Wrapper for that token.
-
-        // There are 2 possible scenarios
-        // 1. _token is ERC-20 origin and there is a ERC-223 version of that token either created or predicted
-        //    by the converter. In that case `standard()` call on _token MUST fail or return something other than 223
-        //    and the converters `predictWrapperAddress` for _token must be _token223 address.
-        // 2. _token is ERC-20 wrapper created by the converter, then `standard()` call on that token MUST fail
-        //    and there MUST be an existing ERC-223 origin for that token in the converter
-        //    and it MUST be _token223 address.
-        //    `standard()` call on _token223 MUST succeed and return 223 in that case.
-
-
-        // In any scenario _token MUST NOT be a ERC-223 token.
-        (bool _success, bytes memory _data) = _token.staticcall(abi.encodeWithSelector(0x5a3b7e42)); // call `standard() returns uint32`
-        // It is important to note that the call may be handled by the fallback function
-        // of the token contract.
-        // In this case it will succeed but the returned `_data` will be empty.
-                
-        // Make sure that `standard()` call fails or returns something other than 223 for _token.
-        // Note that if there is a fallback function in the token contract
-        // then it MAY handle the `standard()` call.
-        require(!_success              // The call failed i.e. token doesn't implement `standard()` func.
-                || _data.length == 0   // The call was handled by the fallback function of the token.
-                || abi.decode(_data,(uint32)) != uint32(223), // The token implements `standard()` and it responds that it is not ERC-223.
-                "FACTORY: ERC20_IS_ERC223");
-
-        if(!converter.isWrapper(_token))
-        {
-            // We assume scenario 1, _token is ERC-20 origin.
-
-            // Now check if the _token223 is a ERC-223 wrapper or can be predicted as a ERC-223 wrapper by the converter.
-            uint256 _code_size;
-            // solhint-disable-next-line no-inline-assembly
-            assembly { _code_size := extcodesize(_token223) }
-
-            if(_code_size > 0)
-            {
-                // Assume that _token223 is a deployed ERC-223 token contract,
-                // it MUST be created by the converter and it MUST respond that it is a ERC-223 token via standard() func.
-                (bool _s1Success, bytes memory _s1Data) = _token223.staticcall(abi.encodeWithSelector(0x5a3b7e42)); // call `standard() returns uint32`
-
-                // Check if the token responds that its ERC-223.
-                require(_s1Success && abi.decode(_s1Data,(uint32)) == uint32(223),
-                    "FACTORY: NOT_ERC223_TOKEN"); 
-
-                // Check if converter identifies the ERC-223 wrapper
-                // as a wrapper for our exact ERC-20 _token.
-                require(converter.getERC20OriginFor(_token223) == _token,
-                    "FACTORY: ERC223_ORIGIN_MISMATCH"); 
-
-                return; // All checks passed for scenario 1.
-            }
-            else
-            {
-                // Assume that _token223 is not yet deployed,
-                // in this case it must be predicted by the converter.
-
-                // Check if the "predicted ERC-223-Wrapper address" for our _token
-                // would be the exact _token223 address.
-                require(converter.predictWrapperAddress(_token, true) == _token223,
-                    "FACTORY: PREDICTED_ADDR_MISMATCH");
-
-                return; // All checks passed for scenario 1.
-            }
-        }
-        else 
-        {
-            // We assume scenario 2, _token is ERC-20-Wrapper created by the converter,
-            // and there is a ERC-223 origin for that token and it is _token223.
-
-            uint256 _erc20_code_size;
-            assembly { _erc20_code_size := extcodesize(_token) }
-
-            if(_erc20_code_size > 0)
-            {
-                // Only check if the provided token is recognized by the converter if it is already created.
-                // Otherwise checking if the converter predicts its address would be sufficient.
-                require(converter.getERC223OriginFor(_token) == _token223,
-                    "FACTORY: ERC223_ORIGIN_MISMATCH");
-
-                // The main purpose of this check is to prevent users from creating an incorrectly set pool
-                // for an existing token and therefore "banning" the creation of new (correct) pool with this token
-                // in the future.
-            }
-            require(converter.predictWrapperAddress(_token223, false) == _token,
-                "FACTORY: WRAPPER_ADDR_MISMATCH");
-
-            uint256 _origin_code_size;
-            // solhint-disable-next-line no-inline-assembly
-            assembly { _origin_code_size := extcodesize(_token223) }
-            require(_origin_code_size > 0, "FACTORY: ERC223_ORIGIN_NOT_DEPLOYED"); // Origin MUST exist.
-
-            (bool _s2Success, bytes memory _s2Data) = _token223.staticcall(abi.encodeWithSelector(0x5a3b7e42));
-
-            // The ERC-223 token MUST implement `standard()` func.
-            // If it doesn't - then its not a valid ERC-223 token.
-            require(_s2Success && abi.decode(_s2Data,(uint32)) == uint32(223),
-                "FACTORY: INVALID_ERC223_STANDARD");
-
-            return; // All checks passed for scenario 2.
-        }
-
-        // Note: unreachable due to the if/else above both having returns,
-        // but kept as a safety net.
-        revert("FACTORY: UNRESOLVABLE_TOKEN"); // Explicitly fail the transaction in any case of uncertainty.
+        Dex223TokenValidator(tokenValidator).identifyTokens(_token, _token223, address(converter));
     }
 
 
